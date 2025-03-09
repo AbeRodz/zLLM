@@ -32,7 +32,8 @@ pub const ModelRegistry = struct {
     }
 };
 // TODO
-pub const MODELS = [_]ModelRegistry{
+pub const Registered = [_]ModelRegistry{
+    ModelRegistry.init(),
     ModelInfo.init("vit-base", "https://huggingface.co/google/vit-base-patch16-224/resolve/main/", &[_][]const u8{
         "model.safetensors?download=true",
         "config.json",

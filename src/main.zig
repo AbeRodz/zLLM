@@ -17,7 +17,7 @@ pub fn main() !void {
     if (args.next()) |num_threads_str| {
         client.NUM_THREADS = try std.fmt.parseInt(usize, num_threads_str, 10);
     }
-    const model_info = models.findModel(model_name) orelse {
+    const model_info = try models.findModel(model_name) orelse {
         std.debug.print("Unknown model: {s}\n", .{model_name});
         return error.UnknownModel;
     };
