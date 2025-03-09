@@ -1,0 +1,6 @@
+.zig-cache
+zig-out
+*.bin
+*.safetensors
+config.json
+preprocessor_config.json
