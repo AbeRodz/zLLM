@@ -7,8 +7,8 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     var args = std.process.args();
-    _ = args.skip(); // Skip program name
-
+    _ = args.skip();
+    try models.checkDir(allocator);
     const model_name = args.next() orelse {
         std.debug.print("Usage: downloader <model-name> [output-path] [threads]\n", .{});
         return error.InvalidUsage;
@@ -17,10 +17,18 @@ pub fn main() !void {
     if (args.next()) |num_threads_str| {
         client.NUM_THREADS = try std.fmt.parseInt(usize, num_threads_str, 10);
     }
-    const model_info = try models.findModel(model_name) orelse {
-        std.debug.print("Unknown model: {s}\n", .{model_name});
-        return error.UnknownModel;
+    const model_info = models.findModel(model_name) catch |err| {
+        if (err == error.PreexistingModelFound) {
+            std.debug.print("Model already downloaded: {s}\n", .{model_name});
+            return err;
+        }
+        return err;
     };
 
-    try client.downloader(model_info, allocator);
+    if (model_info == null) {
+        std.debug.print("Unknown model: {s}\n", .{model_name});
+        return error.UnknownModel;
+    }
+
+    try client.downloader(model_info.?, allocator);
 }

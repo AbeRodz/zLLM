@@ -2,6 +2,7 @@ const std = @import("std");
 const http = std.http;
 const Thread = std.Thread;
 const ModelInfo = @import("models.zig").ModelInfo;
+const ModelRegistry = @import("models.zig");
 
 pub const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB chunks for parallel download
 pub var NUM_THREADS: usize = 4; // Adjust based on network and CPU
@@ -128,6 +129,16 @@ pub fn downloadConfigFile(allocator: std.mem.Allocator, url: []const u8, file_pa
     std.debug.print("Config file downloaded: {s}\n", .{file_path});
 }
 
+pub fn ensureParentDirExists(file_path: []const u8) !void {
+    const dir_path = std.fs.path.dirname(file_path).?;
+
+    std.fs.makeDirAbsolute(dir_path) catch |err| {
+        if (err != error.PathAlreadyExists) {
+            return err;
+        }
+    };
+}
+
 pub fn parallelDownload(allocator: std.mem.Allocator, url: []const u8, file_path: []const u8) !void {
     var client = http.Client{ .allocator = allocator };
     defer client.deinit();
@@ -176,12 +187,13 @@ pub fn parallelDownload(allocator: std.mem.Allocator, url: []const u8, file_path
 
 pub fn downloader(model_info: ModelInfo, allocator: std.mem.Allocator) !void {
     for (model_info.files) |file_name| {
-        var full_url_buffer: [256]u8 = undefined;
-        const full_url = try std.fmt.bufPrint(&full_url_buffer, "{s}{s}", .{ model_info.base_uri, file_name });
+        var full_url_buffer: [128]u8 = undefined;
+        const full_url = try std.fmt.bufPrint(&full_url_buffer, "{s}{s}?download=true", .{ model_info.base_uri, file_name });
 
-        const file_path = std.fs.path.basename(file_name);
-        std.debug.print("Downloading: {s}\n", .{file_path});
-        if (std.mem.endsWith(u8, file_name, ".safetensors?download=true")) {
+        const file_path = try model_info.localFilePath(model_info.name, file_name);
+        try ensureParentDirExists(file_path);
+        std.debug.print("Downloading: {s}\n", .{file_name});
+        if (std.mem.endsWith(u8, file_name, ".safetensors")) {
             try parallelDownload(allocator, full_url, file_path);
             continue;
         } else {
