@@ -1,8 +1,8 @@
 const std = @import("std");
 const http = std.http;
 const Thread = std.Thread;
-const ModelInfo = @import("models.zig").ModelInfo;
-const ModelRegistry = @import("models.zig");
+const ModelInfo = @import("model_registry.zig").ModelInfo;
+const ModelRegistry = @import("model_registry.zig");
 
 pub const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB chunks for parallel download
 pub var NUM_THREADS: usize = 4; // Adjust based on network and CPU

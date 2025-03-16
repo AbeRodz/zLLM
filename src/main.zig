@@ -1,5 +1,5 @@
 const std = @import("std");
-const models = @import("models.zig");
+const models = @import("model_registry.zig");
 const client = @import("client.zig");
 
 pub fn main() !void {
