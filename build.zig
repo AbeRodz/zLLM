@@ -39,8 +39,23 @@ pub fn build(b: *std.Build) void {
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
-    b.installArtifact(exe);
+    // Include paths for ggml and llama.cpp
+    exe.addIncludePath(b.path("llama.cpp"));
+    exe.addIncludePath(b.path("llama.cpp/include"));
+    exe.addIncludePath(b.path("llama.cpp/ggml/include"));
+    exe.addCSourceFile(.{
+        .file = b.path("llama.cpp/src/llama.cpp"),
+        .flags = &[_][]const u8{
+            "-g", "-O3", "-pthread", "-std=c++17",
+        },
+    });
 
+    exe.linkSystemLibrary("stdc++");
+    exe.linkSystemLibrary("pthread");
+    exe.linkSystemLibrary("m");
+    exe.linkLibCpp();
+
+    b.installArtifact(exe);
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish
     // such a dependency.
