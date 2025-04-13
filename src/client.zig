@@ -196,6 +196,9 @@ pub fn downloader(model_info: ModelInfo, allocator: std.mem.Allocator) !void {
         if (std.mem.endsWith(u8, file_name, ".safetensors")) {
             try parallelDownload(allocator, full_url, file_path);
             continue;
+        } else if (std.mem.endsWith(u8, file_name, ".gguf")) {
+            try parallelDownload(allocator, full_url, file_path);
+            continue;
         } else {
             try downloadConfigFile(allocator, full_url, file_path);
         }

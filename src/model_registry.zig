@@ -77,6 +77,14 @@ pub const MODELS = [_]ModelInfo{
         "model.safetensors",
         "config.json",
     }),
+    ModelInfo.init("gemma-3-1b", fmtBaseUri("google/gemma-3-1b-it-qat-q4_0-gguf") catch unreachable, &[_][]const u8{
+        "gemma-3-1b-it-q4_0.gguf",
+    }),
+    ModelInfo.init("gpt-2", fmtBaseUri("openai-community/gpt2") catch unreachable, &[_][]const u8{
+        "model.safetensors",
+        "config.json",
+        "tokenizer.json",
+    }),
 };
 
 pub fn findModel(name: []const u8) !?ModelInfo {
@@ -89,4 +97,24 @@ pub fn findModel(name: []const u8) !?ModelInfo {
         }
     }
     return null;
+}
+
+//temporary
+pub fn findModelErrorless(name: []const u8) !?ModelInfo {
+    for (MODELS) |m| {
+        if (std.mem.eql(u8, m.name, name)) {
+            return m;
+        }
+    }
+    return null;
+}
+pub fn listAvailableModels(allocator: std.mem.Allocator) ![]ModelInfo {
+    var list = std.ArrayList(ModelInfo).init(allocator);
+
+    for (MODELS) |m| {
+        if (try m.isCached()) {
+            try list.append(m);
+        }
+    }
+    return list.toOwnedSlice();
 }
