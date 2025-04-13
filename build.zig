@@ -43,12 +43,52 @@ pub fn build(b: *std.Build) void {
     exe.addIncludePath(b.path("llama.cpp"));
     exe.addIncludePath(b.path("llama.cpp/include"));
     exe.addIncludePath(b.path("llama.cpp/ggml/include"));
-    exe.addCSourceFile(.{
-        .file = b.path("llama.cpp/src/llama.cpp"),
-        .flags = &[_][]const u8{
-            "-g", "-O3", "-pthread", "-std=c++17",
-        },
-    });
+    exe.addIncludePath(b.path("llama.cpp/ggml/src"));
+    const llama_c_sources = &[_][]const u8{
+        "llama.cpp/ggml/src/ggml.c",
+        "llama.cpp/ggml/src/ggml-alloc.c",
+        "llama.cpp/ggml/src/ggml-quants.c",
+    };
+    const llama_cpp_sources = &[_][]const u8{
+        "llama.cpp/ggml/src/ggml-backend.cpp",
+        "llama.cpp/ggml/src/ggml-backend-reg.cpp",
+        "llama.cpp/ggml/src/ggml-threading.cpp",
+        "llama.cpp/ggml/src/gguf.cpp",
+        "llama.cpp/src/llama-model.cpp",
+        "llama.cpp/src/llama-arch.cpp",
+        "llama.cpp/src/llama-adapter.cpp",
+        "llama.cpp/src/llama-kv-cache.cpp",
+        "llama.cpp/src/llama-batch.cpp",
+        "llama.cpp/src/llama-cparams.cpp",
+        "llama.cpp/src/llama-graph.cpp",
+        "llama.cpp/src/llama-hparams.cpp",
+        "llama.cpp/src/llama.cpp",
+        "llama.cpp/src/llama-chat.cpp",
+        "llama.cpp/src/llama-vocab.cpp",
+        "llama.cpp/src/llama-model-loader.cpp",
+        "llama.cpp/src/llama-impl.cpp",
+        "llama.cpp/src/unicode.cpp",
+        "llama.cpp/src/unicode-data.cpp",
+        "llama.cpp/src/llama-grammar.cpp",
+        "llama.cpp/src/llama-mmap.cpp",
+    };
+    for (llama_c_sources) |cfile| {
+        exe.addCSourceFile(.{
+            .file = b.path(cfile),
+            .flags = &[_][]const u8{}, // no C++ flags here
+        });
+    }
+    for (llama_cpp_sources) |src| {
+        exe.addCSourceFile(.{
+            .file = b.path(src),
+            .flags = &[_][]const u8{
+                "-g",
+                "-O3",
+                "-pthread",
+                "-std=c++17",
+            },
+        });
+    }
 
     exe.linkSystemLibrary("stdc++");
     exe.linkSystemLibrary("pthread");
