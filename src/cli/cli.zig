@@ -1,7 +1,8 @@
 const std = @import("std");
-const models = @import("model_registry.zig");
-const client = @import("client.zig");
-const gguf = @import("./llama/gguf_converter.zig");
+const models = @import("../registry/model_registry.zig");
+const client = @import("../client/client.zig");
+const gguf = @import("../llama/gguf_converter.zig");
+const llama = @import("../llama/llama.zig");
 
 fn get(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     const model_name = args.next() orelse return error.InvalidUsage;
@@ -55,7 +56,13 @@ fn convert(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     );
 }
 
-pub fn run() !void {
+fn run(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
+    const model_name = args.next() orelse return error.InvalidUsage;
+    const n_ctx = 512;
+    try llama.execute("What is the capital of France?", model_name, n_ctx, allocator);
+}
+
+pub fn init() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
@@ -75,8 +82,8 @@ pub fn run() !void {
         try convert(&args, allocator);
     } else if (std.mem.eql(u8, command, "help")) {
         printUsage();
-    } else if (std.mem.eql(u8, command, "run")) {
-        // TODO implement model execution
+    } else if (std.mem.eql(u8, command, "execute")) {
+        try run(&args, allocator);
     } else {
         std.debug.print("Unknown command: {s}\n", .{command});
         printUsage();

@@ -42,6 +42,7 @@ pub fn build(b: *std.Build) void {
     // Include paths for ggml and llama.cpp
     exe.addIncludePath(b.path("llama.cpp"));
     exe.addIncludePath(b.path("llama.cpp/include"));
+    exe.addIncludePath(b.path("llama.cpp/common"));
     exe.addIncludePath(b.path("llama.cpp/ggml/include"));
     exe.addIncludePath(b.path("llama.cpp/ggml/src"));
     const llama_c_sources = &[_][]const u8{
@@ -54,12 +55,17 @@ pub fn build(b: *std.Build) void {
         "llama.cpp/ggml/src/ggml-backend-reg.cpp",
         "llama.cpp/ggml/src/ggml-threading.cpp",
         "llama.cpp/ggml/src/gguf.cpp",
+        "llama.cpp/common/common.cpp",
+        "llama.cpp/common/log.cpp",
         "llama.cpp/src/llama-model.cpp",
         "llama.cpp/src/llama-arch.cpp",
         "llama.cpp/src/llama-adapter.cpp",
         "llama.cpp/src/llama-kv-cache.cpp",
         "llama.cpp/src/llama-batch.cpp",
         "llama.cpp/src/llama-cparams.cpp",
+        "llama.cpp/src/llama-context.cpp",
+        "llama.cpp/src/llama-io.cpp",
+        "llama.cpp/src/llama-sampling.cpp",
         "llama.cpp/src/llama-graph.cpp",
         "llama.cpp/src/llama-hparams.cpp",
         "llama.cpp/src/llama.cpp",

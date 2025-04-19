@@ -1,8 +1,8 @@
 const std = @import("std");
 const http = std.http;
 const Thread = std.Thread;
-const ModelInfo = @import("model_registry.zig").ModelInfo;
-const ModelRegistry = @import("model_registry.zig");
+const ModelInfo = @import("../registry/model_registry.zig").ModelInfo;
+const ModelRegistry = @import("../registry/model_registry.zig");
 const progressBar = @import("progress_bar.zig");
 const DownloadContext = @import("download_context.zig").DownloadContext;
 
