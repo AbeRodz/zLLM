@@ -11,13 +11,13 @@
                 "type": "cppdbg",
                 "request": "launch",
                 "program": "${workspaceFolder}/zig-out/bin/zLLM",
-                "args": ["vit-base"],
+                "args": ["download","gemma-3-1b"],
                 "stopAtEntry": false,
                 "cwd": "${workspaceFolder}",
                 "environment": [],
                 "externalConsole": false,
                 "internalConsoleOptions": "openOnSessionStart",
-               // "MIMode": "lldb",
+               "MIMode": "lldb",
                 //"preLaunchTask": "build"
             }
         ]

@@ -4,3 +4,4 @@ zig-out
 *.safetensors
 config.json
 preprocessor_config.json
+.env
