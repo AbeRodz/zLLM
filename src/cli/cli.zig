@@ -12,7 +12,6 @@ fn get(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
 
     const model = models.findModel(model_name) catch |err| {
         if (err == error.PreexistingModelFound) {
-            std.debug.print("Model already downloaded: {s}\n", .{model_name});
             return err;
         }
         return err;
@@ -30,7 +29,6 @@ fn convert(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
 
     const model = models.findModelErrorless(model_name) catch |err| {
         if (err == error.PreexistingModelFound) {
-            std.debug.print("Model already downloaded: {s}\n", .{model_name});
             return null;
         }
         return err;
@@ -58,8 +56,8 @@ fn convert(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
 
 fn run(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     const model_name = args.next() orelse return error.InvalidUsage;
-    const n_ctx = 512;
-    try llama.execute("What is the capital of France?", model_name, n_ctx, allocator);
+    const n_ctx = 1024;
+    try llama.execute(model_name, n_ctx, allocator);
 }
 
 pub fn init() !void {
@@ -105,7 +103,7 @@ fn printUsage() void {
         \\  zig build run -- <command> <model-name> [threads]
         \\
         \\Commands:
-        \\  download   Downloads a model from HuggingFace
+        \\  get   Downloads a model from HuggingFace
         \\  convert    Converts a downloaded model to GGUF
         \\  help       Show this message
         \\
