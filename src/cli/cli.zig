@@ -12,7 +12,6 @@ fn get(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
 
     const model = models.findModel(model_name) catch |err| {
         if (err == error.PreexistingModelFound) {
-            std.debug.print("Model already downloaded: {s}\n", .{model_name});
             return err;
         }
         return err;
@@ -29,10 +28,6 @@ fn convert(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     const model_name = args.next() orelse return error.InvalidUsage;
 
     const model = models.findModelErrorless(model_name) catch |err| {
-        if (err == error.PreexistingModelFound) {
-            std.debug.print("Model already downloaded: {s}\n", .{model_name});
-            return null;
-        }
         return err;
     };
 
@@ -58,8 +53,8 @@ fn convert(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
 
 fn run(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     const model_name = args.next() orelse return error.InvalidUsage;
-    const n_ctx = 512;
-    try llama.execute("What is the capital of France?", model_name, n_ctx, allocator);
+    const n_ctx = 1024;
+    try llama.execute(model_name, n_ctx, allocator);
 }
 
 pub fn init() !void {
@@ -82,7 +77,7 @@ pub fn init() !void {
         try convert(&args, allocator);
     } else if (std.mem.eql(u8, command, "help")) {
         printUsage();
-    } else if (std.mem.eql(u8, command, "execute")) {
+    } else if (std.mem.eql(u8, command, "run")) {
         try run(&args, allocator);
     } else {
         std.debug.print("Unknown command: {s}\n", .{command});
@@ -105,7 +100,7 @@ fn printUsage() void {
         \\  zig build run -- <command> <model-name> [threads]
         \\
         \\Commands:
-        \\  download   Downloads a model from HuggingFace
+        \\  get   Downloads a model from HuggingFace
         \\  convert    Converts a downloaded model to GGUF
         \\  help       Show this message
         \\

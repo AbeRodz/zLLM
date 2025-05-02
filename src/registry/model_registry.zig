@@ -1,10 +1,11 @@
 const std = @import("std");
-
-const HF_URL = "https://huggingface.co";
+const json = std.json;
+const embedded_manifest = @embedFile("registry_manifest.json");
 
 const ModelError = error{
     PreexistingModelFound,
     UnknownModel,
+    MissingHome,
 };
 
 pub const ModelInfo = struct {
@@ -37,10 +38,6 @@ pub const ModelInfo = struct {
     }
 };
 
-fn fmtBaseUri(model_name: []const u8) ![]const u8 {
-    return comptime std.fmt.comptimePrint("{s}/{s}/resolve/main/", .{ HF_URL, model_name });
-}
-
 pub fn getCacheDir(allocator: std.mem.Allocator) ![]u8 {
     const home = std.process.getEnvVarOwned(allocator, "HOME") catch return error.MissingHome;
     defer allocator.free(home);
@@ -62,40 +59,16 @@ pub fn checkDir(allocator: std.mem.Allocator) !void {
     defer dir.close();
 }
 
-pub const MODELS = [_]ModelInfo{
-    ModelInfo.init("vit-base", fmtBaseUri("google/vit-base-patch16-224") catch unreachable, &[_][]const u8{
-        "model.safetensors",
-        "config.json",
-        "preprocessor_config.json",
-    }),
-    ModelInfo.init("clip-vit", fmtBaseUri("openai/clip-vit-base-patch32") catch unreachable, &[_][]const u8{
-        "model.safetensors",
-        "config.json",
-        "preprocessor_config.json",
-    }),
-    ModelInfo.init("sam-vit-huge", fmtBaseUri("facebook/sam-vit-huge") catch unreachable, &[_][]const u8{
-        "model.safetensors",
-        "config.json",
-    }),
-    ModelInfo.init("gemma-3-1b", fmtBaseUri("google/gemma-3-1b-it") catch unreachable, &[_][]const u8{
-        "tokenizer.json",
-        "tokenizer.model",
-        "config.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "generation_config.json",
-        "added_tokens.json",
-        "model.safetensors",
-    }),
-    ModelInfo.init("gpt-2", fmtBaseUri("openai-community/gpt2") catch unreachable, &[_][]const u8{
-        "model.safetensors",
-        "config.json",
-        "tokenizer.json",
-    }),
-};
+pub fn parseModels(allocator: std.mem.Allocator) ![]ModelInfo {
+    const parsed = try json.parseFromSlice([]ModelInfo, allocator, embedded_manifest, .{
+        .allocate = .alloc_always,
+    });
+    return parsed.value;
+}
 
 pub fn findModel(name: []const u8) !?ModelInfo {
-    for (MODELS) |m| {
+    const models = try parseModels(std.heap.page_allocator);
+    for (models) |m| {
         if (std.mem.eql(u8, m.name, name)) {
             if (try m.isCached()) {
                 return error.PreexistingModelFound;
@@ -108,7 +81,8 @@ pub fn findModel(name: []const u8) !?ModelInfo {
 
 //temporary
 pub fn findModelErrorless(name: []const u8) !?ModelInfo {
-    for (MODELS) |m| {
+    const models = try parseModels(std.heap.page_allocator);
+    for (models) |m| {
         if (std.mem.eql(u8, m.name, name)) {
             return m;
         }
@@ -116,9 +90,11 @@ pub fn findModelErrorless(name: []const u8) !?ModelInfo {
     return null;
 }
 pub fn listAvailableModels(allocator: std.mem.Allocator) ![]ModelInfo {
+    const models = try parseModels(allocator);
+    defer allocator.free(models);
     var list = std.ArrayList(ModelInfo).init(allocator);
 
-    for (MODELS) |m| {
+    for (models) |m| {
         if (try m.isCached()) {
             try list.append(m);
         }

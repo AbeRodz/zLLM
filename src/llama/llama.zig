@@ -20,78 +20,149 @@ pub fn loadLlamaModelFromRegistry(model_name: []const u8) !*llama.struct_llama_m
     if (gguf_path == null) {
         gguf_path = try modelInfo.localFilePath(modelInfo.name, "model.gguf");
     }
-    llama.ggml_backend_load_all();
+
+    std.debug.print("loading gguf model: {s}\n", .{gguf_path.?});
+
+    llama.llama_backend_init();
 
     var params = llama.llama_model_default_params();
-    const n_gpu_layers = 99;
-    params.n_gpu_layers = n_gpu_layers;
+
+    params.n_gpu_layers = 999;
 
     const model = llama.llama_model_load_from_file(gguf_path.?.ptr, params);
     if (model == null) {
         std.debug.print("Failed to load gguf model: {s}\n", .{gguf_path.?});
         return error.FailedToLoadModel;
     }
+    std.debug.print("Model loaded successfully!\n", .{});
     return model.?;
 }
 
-pub fn execute(user_input: []const u8, model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocator) !void {
+fn appendMessage(
+    allocator: std.mem.Allocator,
+    messages: *std.ArrayList(llama.struct_llama_chat_message),
+    role: [*c]const u8,
+    content: []const u8,
+) !void {
+    const dup = try allocator.dupeZ(u8, content);
+    try messages.append(.{
+        .role = role,
+        .content = dup.ptr,
+    });
+}
+fn applyChatTemplate(
+    allocator: std.mem.Allocator,
+    tmpl: [*c]const u8,
+    messages: std.ArrayList(llama.struct_llama_chat_message),
+    formatted: []u8,
+) ![]u8 {
+    var resized = try allocator.alloc(u8, 512);
+    var new_len = llama.llama_chat_apply_template(
+        tmpl,
+        messages.items.ptr,
+        messages.items.len,
+        true,
+        formatted.ptr,
+        @as(i32, @intCast(formatted.len)),
+    );
+
+    if (new_len < 0) {
+        std.log.err("Failed to apply chat template\n", .{});
+        return error.TemplateFailure;
+    }
+
+    if (@as(usize, @intCast(new_len)) > formatted.len) {
+        resized = try allocator.alloc(u8, @as(usize, @intCast(new_len)));
+        new_len = llama.llama_chat_apply_template(
+            tmpl,
+            messages.items.ptr,
+            messages.items.len,
+            true,
+            resized.ptr,
+            @as(i32, @intCast(formatted.len)),
+        );
+        return resized[0..@as(usize, @intCast(new_len))];
+    }
+
+    return formatted[0..@as(usize, @intCast(new_len))];
+}
+
+fn calculateBufferSize(n_ctx: u32, bytes_per_token: u32, headroom_percent: u32) usize {
+    const base_size = n_ctx * bytes_per_token;
+    return base_size + (base_size * headroom_percent / 100);
+}
+
+pub fn execute(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocator) !void {
+    const stdout = std.io.getStdOut().writer();
+    const stdin = std.io.getStdIn().reader();
+
     const model = try loadLlamaModelFromRegistry(model_name);
     defer llama.llama_free_model(model);
+
     const ctx = try llama_context(model, n_ctx);
     defer llama.llama_free(ctx);
+
     const sampler = llama_sampler();
     const tmpl = llama.llama_model_chat_template(model, null);
+
     var messages = std.ArrayList(llama.struct_llama_chat_message).init(allocator);
     defer messages.deinit();
 
-    const max_buf_size = n_ctx;
-    var formatted = try allocator.alloc(u8, max_buf_size);
+    var line_buf: [1024]u8 = undefined;
+
+    const bytes_per_token = 4; // Could tune based on profiling
+    const headroom = 20;
+
+    const buffer_size = calculateBufferSize(n_ctx, bytes_per_token, headroom);
+    const backing_mem = try allocator.alloc(u8, buffer_size);
+    defer allocator.free(backing_mem);
+
+    var fixed_buffer_allocator = std.heap.FixedBufferAllocator.init(backing_mem);
+    const fast_alloc = fixed_buffer_allocator.allocator();
+
+    const formatted = try allocator.alloc(u8, n_ctx);
     defer allocator.free(formatted);
 
-    var prev_len: usize = 0;
+    // Greeting
+    const init_prompt = "Please greet the user.";
+    try appendMessage(allocator, &messages, "user", init_prompt);
+
+    const greeting_prompt = try applyChatTemplate(fast_alloc, tmpl, messages, formatted);
+    try stdout.print("\x1b[33m", .{});
+    const greeting_response = try generate(ctx, sampler, model, fast_alloc, greeting_prompt, stdout);
+    try stdout.print("\n\x1b[0m", .{});
+
+    try appendMessage(allocator, &messages, "assistant", greeting_response);
+
+    // Chat Loop
     while (true) {
-        std.debug.print("\x1b[32m> \x1b[0m", .{});
+        try stdout.print("\x1b[32m> \x1b[0m", .{});
+        const input = try stdin.readUntilDelimiterOrEof(&line_buf, '\n');
+        if (input == null or input.?.len == 0) break;
 
-        if (user_input.len == 0) break;
+        try appendMessage(allocator, &messages, "user", input.?);
 
-        const user_input_dup = try allocator.dupeZ(u8, user_input);
+        const prompt = try applyChatTemplate(fast_alloc, tmpl, messages, formatted);
 
-        // Add user message
-        try messages.append(.{
-            .role = "user",
-            .content = user_input_dup.ptr,
-        });
+        try stdout.print("\x1b[33m", .{});
+        const response = try generate(ctx, sampler, model, fast_alloc, prompt, stdout);
+        try stdout.print("\n\x1b[0m", .{});
 
-        // Apply template
-        var new_len = llama.llama_chat_apply_template(tmpl, messages.items.ptr, messages.items.len, true, formatted.ptr, @as(i32, @intCast(formatted.len)));
-        if (new_len < 0) {
-            std.debug.print("Failed to apply chat template\n", .{});
-            return;
-        }
+        try appendMessage(allocator, &messages, "assistant", response);
 
-        // If too small, resize and try again
-        if (@as(usize, @intCast(new_len)) > formatted.len) {
-            formatted = try allocator.realloc(formatted, @as(usize, @intCast(new_len)));
-            new_len = llama.llama_chat_apply_template(tmpl, messages.items.ptr, messages.items.len, true, formatted.ptr, @as(i32, @intCast(formatted.len)));
-        }
-
-        const prompt = formatted[prev_len..@as(usize, @intCast(new_len))];
-
-        std.debug.print("\x1b[33m", .{});
-        const response = try generate(ctx, sampler, model, allocator, prompt);
-        std.debug.print("\n\x1b[0m", .{});
-
-        const resp_dup = try allocator.dupeZ(u8, response);
-        try messages.append(.{
-            .role = "assistant",
-            .content = resp_dup.ptr,
-        });
-
-        prev_len = @as(usize, @intCast(new_len));
+        // Reset the allocator after each loop to reuse the same memory
+        fixed_buffer_allocator.reset();
     }
 }
 
-fn generate(ctx: *llama.struct_llama_context, smpl: [*c]llama.struct_llama_sampler, model: *llama.struct_llama_model, allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
+fn generate(
+    ctx: *llama.struct_llama_context,
+    smpl: [*c]llama.struct_llama_sampler,
+    model: *llama.struct_llama_model,
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    writer: anytype,
+) ![]u8 {
     const vocab = llama.llama_model_get_vocab(model);
 
     const is_first = llama.llama_kv_self_used_cells(ctx) == 0;
@@ -111,23 +182,21 @@ fn generate(ctx: *llama.struct_llama_context, smpl: [*c]llama.struct_llama_sampl
 
     while (true) {
         const n_ctx_used = llama.llama_kv_self_used_cells(ctx);
-        if (n_ctx_used + batch.n_tokens > llama.llama_n_ctx(ctx)) {
-            break;
-        }
+        if (n_ctx_used + batch.n_tokens > llama.llama_n_ctx(ctx)) break;
 
-        if (llama.llama_decode(ctx, batch) != 0) {
-            return error.DecodeFailed;
-        }
+        if (llama.llama_decode(ctx, batch) != 0) return error.DecodeFailed;
 
         new_token_id = llama.llama_sampler_sample(smpl, ctx, -1);
         if (llama.llama_vocab_is_eog(vocab, new_token_id)) break;
 
-        var buf: [256]u8 = undefined;
+        var buf: [4096]u8 = undefined;
         const len = llama.llama_token_to_piece(vocab, new_token_id, &buf, buf.len, 0, true);
         if (len < 0) return error.TokenToPieceFailed;
 
-        try response.appendSlice(buf[0..@as(usize, @intCast(len))]);
-        std.debug.print("{s}", .{buf[0..@as(usize, @intCast(len))]});
+        const slice = buf[0..@as(usize, @intCast(len))];
+        try response.appendSlice(slice);
+        try writer.print("{s}", .{slice});
+
         batch = llama.llama_batch_get_one(&new_token_id, 1);
     }
 

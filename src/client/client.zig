@@ -265,7 +265,6 @@ pub fn downloader(model_info: ModelInfo, allocator: std.mem.Allocator) !void {
                 else => return e,
             };
         if (backoff_ns > 0) {
-            std.debug.print("Sleeping for {} ns before next config...\n", .{backoff_ns});
             std.time.sleep(backoff_ns);
         }
 

@@ -1,0 +1,35 @@
+[
+    {
+      "name": "gpt-2",
+      "base_uri": "https://huggingface.co/openai-community/gpt2/resolve/main/",
+      "files": [
+        "model.safetensors",
+        "config.json",
+        "tokenizer.json"
+      ]
+    },
+    {
+      "name": "vit-base",
+      "base_uri": "https://huggingface.co/google/vit-base-patch16-224/resolve/main/",
+      "files": [
+        "model.safetensors",
+        "config.json",
+        "preprocessor_config.json"
+      ]
+    },
+    {
+        "name":"gemma-3-1b",
+        "base_uri": "https://huggingface.co/google/gemma-3-1b-it/resolve/main/",
+        "files":[
+            "tokenizer.json",
+            "tokenizer.model",
+            "config.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "generation_config.json",
+            "added_tokens.json",
+            "model.safetensors"
+        ]
+    }
+  ]
+  
