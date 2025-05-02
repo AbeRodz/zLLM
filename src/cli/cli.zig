@@ -77,7 +77,7 @@ pub fn init() !void {
         try convert(&args, allocator);
     } else if (std.mem.eql(u8, command, "help")) {
         printUsage();
-    } else if (std.mem.eql(u8, command, "execute")) {
+    } else if (std.mem.eql(u8, command, "run")) {
         try run(&args, allocator);
     } else {
         std.debug.print("Unknown command: {s}\n", .{command});
