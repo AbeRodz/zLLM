@@ -28,9 +28,6 @@ fn convert(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     const model_name = args.next() orelse return error.InvalidUsage;
 
     const model = models.findModelErrorless(model_name) catch |err| {
-        if (err == error.PreexistingModelFound) {
-            return null;
-        }
         return err;
     };
 
