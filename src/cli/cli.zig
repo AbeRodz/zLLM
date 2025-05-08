@@ -3,6 +3,8 @@ const models = @import("../registry/model_registry.zig");
 const client = @import("../client/client.zig");
 const gguf = @import("../llama/gguf_converter.zig");
 const llama = @import("../llama/llama.zig");
+const tk = @import("tokamak");
+const api = @import("../api/api.zig");
 
 fn get(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     const model_name = args.next() orelse return error.InvalidUsage;
@@ -53,8 +55,13 @@ fn convert(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
 
 fn run(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     const model_name = args.next() orelse return error.InvalidUsage;
-    const n_ctx = 1024;
+    const n_ctx = 8192;
     try llama.execute(model_name, n_ctx, allocator);
+}
+
+fn ApiRun(_: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
+    var server = try tk.Server.init(allocator, api.routes, .{ .listen = .{ .port = 8080 } });
+    try server.start();
 }
 
 pub fn init() !void {
@@ -79,6 +86,8 @@ pub fn init() !void {
         printUsage();
     } else if (std.mem.eql(u8, command, "run")) {
         try run(&args, allocator);
+    } else if (std.mem.eql(u8, command, "api-run")) {
+        try ApiRun(&args, allocator);
     } else {
         std.debug.print("Unknown command: {s}\n", .{command});
         printUsage();

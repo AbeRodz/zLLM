@@ -10,6 +10,7 @@
 - Integrated model registry (`registry_manifest.json`)
 - Supports model download, GGUF conversion, and inference
 - MacOS (Metal) support via llama.cpp
+- Currently supports OpenAI's chat completions, enough to use Python's OpenAI client library.
 
 ---
 
@@ -61,6 +62,12 @@ Runs inference on the model:
 zig build run -- run gemma-3-1b
 ```
 
+## 🌐 Run (API)
+Runs inference API:
+```sh
+zig build run -- api-run
+```
+
 ## ⚙️ Direct Binary Execution
 
 You only need to run zig build once. You can then use the built binary directly:
@@ -82,3 +89,62 @@ The list of supported models is defined in [registry_manifest.json](src/registry
 
 - gemma-3-1b
 - gpt-2
+
+## OpenAI API Support
+
+Currently supports the chat completions endpoint example cURL:
+
+```sh
+curl --location 'http://localhost:8080/v1/chat/completions' \
+--header 'Content-Type: application/json' \
+--data '{
+    "model": "gemma-3-1b",
+    "messages": [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant that only knows about math and nothing more, if what you are asked about is not about math respond just with i dont know."
+            },
+            {
+                "role": "user",
+                "content": "i would like about the history of america"
+            }
+    ],
+    "frequency_penalty": 0.5,
+    "max_tokens": 100,
+    "presence_penalty": 0.3,
+    "stop": ["stop"],
+    "stream": false,
+    "temperature": 0.8,
+    "top_p": 1.0
+}
+'
+```
+
+Not all fields from the chat completions are currently supported or do anything per se, but it's enough to use Python's OpenAI client:
+
+```python
+import openai
+
+client = openai.OpenAI(
+  base_url="http://localhost:8080/v1/", # local zLLM server
+  api_key= "apiKey" # dummy apiKey
+)
+
+completion = client.chat.completions.create(
+    stream=False,
+    model="gemma-3-1b", # model saved on registry
+    messages=  [
+        {
+            'role': 'user',
+            'content': {
+                "text": "I'm doing good"
+            },
+        }
+    ],
+    max_tokens=256,
+    temperature=0.8,
+)
+
+print(completion.choices[0].content)
+# i dont know -> expected response given the example above.
+```
