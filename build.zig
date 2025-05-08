@@ -5,6 +5,7 @@ const BuildContext = @import("build_context.zig").BuildContext;
 const CompilerConfig = @import("build_platform.zig").CompilerConfig;
 const Platform = @import("build_platform.zig").Platform;
 const addCBuildSources = @import("build_csources.zig").addCBuildSources;
+const tokamak = @import("tokamak");
 
 pub const Options = struct {
     target: std.Build.ResolvedTarget,
@@ -83,6 +84,13 @@ pub fn build(b: *std.Build) void {
     exe.want_lto = false;
     ctx.llama.common(exe);
     ctx.link(exe);
+
+    const uuid = b.dependency("uuid", .{
+        .target = ctx.options.target,
+        .optimize = ctx.options.optimize,
+    });
+    exe.root_module.addImport("uuid", uuid.module("uuid"));
+    tokamak.setup(exe, .{});
 
     ctx.b.installArtifact(exe);
     // Run step

@@ -1,10 +1,13 @@
 const std = @import("std");
 const gguf = @import("gguf_converter.zig");
 const registry = @import("../registry/model_registry.zig");
-
+const registryRuntime = @import("../registry/runtime.zig");
+const RingBuffer = @import("../utils/ring_buffer.zig").RingBuffer;
 pub const llama = @cImport({
     @cInclude("llama.h");
 });
+
+var message_ring = RingBuffer(llama.struct_llama_chat_message, 32).init();
 
 pub fn loadLlamaModelFromRegistry(model_name: []const u8) !*llama.struct_llama_model {
     const modelInfo = try registry.findModelErrorless(model_name) orelse return error.UnknownModel;
@@ -40,12 +43,12 @@ pub fn loadLlamaModelFromRegistry(model_name: []const u8) !*llama.struct_llama_m
 
 fn appendMessage(
     allocator: std.mem.Allocator,
-    messages: *std.ArrayList(llama.struct_llama_chat_message),
+    //messages: *std.ArrayList(llama.struct_llama_chat_message),
     role: [*c]const u8,
     content: []const u8,
 ) !void {
     const dup = try allocator.dupeZ(u8, content);
-    try messages.append(.{
+    _ = message_ring.push(.{
         .role = role,
         .content = dup.ptr,
     });
@@ -53,14 +56,16 @@ fn appendMessage(
 fn applyChatTemplate(
     allocator: std.mem.Allocator,
     tmpl: [*c]const u8,
-    messages: std.ArrayList(llama.struct_llama_chat_message),
+    //messages: std.ArrayList(llama.struct_llama_chat_message),
+    messages: RingBuffer(llama.struct_llama_chat_message, 32),
     formatted: []u8,
 ) ![]u8 {
     var resized = try allocator.alloc(u8, 512);
+    const c_messages: [*c]const llama.struct_llama_chat_message = @ptrCast(&messages.data[0]);
     var new_len = llama.llama_chat_apply_template(
         tmpl,
-        messages.items.ptr,
-        messages.items.len,
+        c_messages,
+        messages.count,
         true,
         formatted.ptr,
         @as(i32, @intCast(formatted.len)),
@@ -75,8 +80,8 @@ fn applyChatTemplate(
         resized = try allocator.alloc(u8, @as(usize, @intCast(new_len)));
         new_len = llama.llama_chat_apply_template(
             tmpl,
-            messages.items.ptr,
-            messages.items.len,
+            c_messages,
+            messages.count,
             true,
             resized.ptr,
             @as(i32, @intCast(formatted.len)),
@@ -90,6 +95,40 @@ fn applyChatTemplate(
 fn calculateBufferSize(n_ctx: u32, bytes_per_token: u32, headroom_percent: u32) usize {
     const base_size = n_ctx * bytes_per_token;
     return base_size + (base_size * headroom_percent / 100);
+}
+pub fn respondToPrompt(
+    allocator: std.mem.Allocator,
+    model_name: []const u8,
+    n_ctx: u32,
+    prompt: []const u8,
+) ![]u8 {
+    const loaded = try registryRuntime.getOrLoadModel(allocator, model_name, 8192);
+    const tmpl = llama.llama_model_chat_template(loaded.model, null);
+    const sampler = llama_sampler();
+
+    const bytes_per_token = 4;
+    const headroom = 20;
+    const buffer_size = calculateBufferSize(n_ctx, bytes_per_token, headroom);
+    const backing_mem = try allocator.alloc(u8, buffer_size);
+    defer allocator.free(backing_mem);
+
+    var fixed_buffer_allocator = std.heap.FixedBufferAllocator.init(backing_mem);
+    const fast_alloc = fixed_buffer_allocator.allocator();
+
+    const formatted = try allocator.alloc(u8, n_ctx);
+    defer allocator.free(formatted);
+
+    try appendMessage(allocator, "user", prompt);
+    const chat_prompt = try applyChatTemplate(fast_alloc, tmpl, message_ring, formatted);
+
+    var response_stream = std.ArrayList(u8).init(allocator);
+    defer response_stream.deinit();
+    const writer = response_stream.writer();
+
+    const response = try generate(loaded.ctx, sampler, loaded.model, fast_alloc, chat_prompt, writer);
+    try appendMessage(allocator, "assistant", response);
+
+    return response_stream.toOwnedSlice();
 }
 
 pub fn execute(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocator) !void {
@@ -105,8 +144,8 @@ pub fn execute(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocator)
     const sampler = llama_sampler();
     const tmpl = llama.llama_model_chat_template(model, null);
 
-    var messages = std.ArrayList(llama.struct_llama_chat_message).init(allocator);
-    defer messages.deinit();
+    //var messages = std.ArrayList(llama.struct_llama_chat_message).init(allocator);
+    //defer messages.deinit();
 
     var line_buf: [1024]u8 = undefined;
 
@@ -125,14 +164,14 @@ pub fn execute(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocator)
 
     // Greeting
     const init_prompt = "Please greet the user.";
-    try appendMessage(allocator, &messages, "user", init_prompt);
+    try appendMessage(allocator, "user", init_prompt);
 
-    const greeting_prompt = try applyChatTemplate(fast_alloc, tmpl, messages, formatted);
+    const greeting_prompt = try applyChatTemplate(fast_alloc, tmpl, message_ring, formatted);
     try stdout.print("\x1b[33m", .{});
     const greeting_response = try generate(ctx, sampler, model, fast_alloc, greeting_prompt, stdout);
     try stdout.print("\n\x1b[0m", .{});
 
-    try appendMessage(allocator, &messages, "assistant", greeting_response);
+    try appendMessage(allocator, "assistant", greeting_response);
 
     // Chat Loop
     while (true) {
@@ -140,16 +179,16 @@ pub fn execute(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocator)
         const input = try stdin.readUntilDelimiterOrEof(&line_buf, '\n');
         if (input == null or input.?.len == 0) break;
 
-        try appendMessage(allocator, &messages, "user", input.?);
+        try appendMessage(allocator, "user", input.?);
 
-        const prompt = try applyChatTemplate(fast_alloc, tmpl, messages, formatted);
+        const prompt = try applyChatTemplate(fast_alloc, tmpl, message_ring, formatted);
 
         try stdout.print("\x1b[33m", .{});
         const response = try generate(ctx, sampler, model, fast_alloc, prompt, stdout);
         try stdout.print("\n\x1b[0m", .{});
 
-        try appendMessage(allocator, &messages, "assistant", response);
-
+        try appendMessage(allocator, "assistant", response);
+        try stdout.print("{d}", .{message_ring.count});
         // Reset the allocator after each loop to reuse the same memory
         fixed_buffer_allocator.reset();
     }
