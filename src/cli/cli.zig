@@ -59,8 +59,11 @@ fn run(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     try llama.execute(model_name, n_ctx, allocator);
 }
 
-fn ApiRun(_: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
-    var server = try tk.Server.init(allocator, api.routes, .{ .listen = .{ .port = 8080 } });
+fn ApiRun(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
+    const port_str = args.next() orelse "8080";
+    const parsedPort = try std.fmt.parseInt(u16, port_str, 10);
+    APIPresentation(parsedPort);
+    var server = try tk.Server.init(allocator, api.routes, .{ .listen = .{ .port = parsedPort } });
     try server.start();
 }
 
@@ -118,4 +121,24 @@ fn printUsage() void {
         \\  zig build run -- convert vit-base
         \\
     , .{});
+}
+
+pub fn APIPresentation(port: u16) void {
+    const YEL = "\x1b[33m";
+    const RED = "\x1b[31m";
+    const GRN = "\x1b[32m";
+    const RESET = "\x1b[0m";
+
+    std.debug.print(YEL ++
+        "          __     __     __  ___\n" ++
+        " ____   / /    / /    /  |/  /\n" ++
+        "/_  /  / /    / /    / /|_/ / \n" ++
+        " / /_ / /___ / /___ / /  / /  \n" ++
+        "/___//_____//_____//_/  /_/   \n" ++
+        "                              \n" ++ RESET, .{});
+
+    std.debug.print(RED ++
+        "Fast, portable and lightweight inference server!\n" ++ RESET, .{});
+
+    std.debug.print("Server running on port: " ++ GRN ++ "{d}\n" ++ RESET, .{port});
 }
