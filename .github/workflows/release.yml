@@ -29,7 +29,7 @@ jobs:
         uses: mlugg/setup-zig@v2
 
       - name: Build Release
-        run: zig build -DReleaseFast
+        run: zig build -Doptimize=ReleaseFast 
 
       - name: Package Binary
         run: |
