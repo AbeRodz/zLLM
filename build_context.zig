@@ -56,12 +56,13 @@ pub const BuildContext = struct {
             .optimize = ctx.optimize,
         });
         lib.root_module.addCMacro("LOG_DISABLE_LOGS", "1");
-        lib.root_module.addCMacro("GGML_USE_METAL", "");
         lib.root_module.addCMacro("GGML_USE_CPU", "1");
-
         lib.root_module.addCMacro("LLAMA_FATAL_WARNINGS", "ON");
-        lib.root_module.addCMacro("GGML_METAL_USE_BF16", "ON");
-        lib.root_module.addCMacro("GGML_METAL_EMBED_LIBRARY", "ON");
+        if (ctx.platform == .Metal) {
+            lib.root_module.addCMacro("GGML_USE_METAL", "");
+            lib.root_module.addCMacro("GGML_METAL_USE_BF16", "ON");
+            lib.root_module.addCMacro("GGML_METAL_EMBED_LIBRARY", "ON");
+        }
         ctx.addAll(lib);
         if (ctx.target.result.abi != .msvc)
             lib.root_module.addCMacro("_GNU_SOURCE", "");
@@ -107,58 +108,38 @@ pub const BuildContext = struct {
         compile.addIncludePath(ctx.path(&.{ "ggml", "include" }));
         compile.addIncludePath(ctx.path(&.{ "ggml", "src" }));
 
-        compile.addIncludePath(ctx.path(&.{ "ggml", "src", "ggml-metal" }));
+        if (ctx.platform == .Metal) {
+            compile.addIncludePath(ctx.path(&.{ "ggml", "src", "ggml-metal" }));
+        }
 
         compile.addIncludePath(ctx.path(&.{ "ggml", "src", "ggml-cpu" }));
 
         compile.addIncludePath(ctx.path(&.{ "ggml", "src", "ggml-blas" }));
         compile.linkLibCpp();
-        // Create a separate Metal library
-        // const metal_lib = ctx.build.addStaticLibrary(.{
-        //     .name = "ggml-metal",
-        //     .target = ctx.target,
-        //     .optimize = ctx.optimize,
-        // });
-        // metal_lib.addIncludePath(ctx.path(&.{ "ggml", "include" }));
-        // metal_lib.addIncludePath(ctx.path(&.{ "ggml", "src" }));
-        // metal_lib.addIncludePath(ctx.path(&.{ "ggml", "src", "ggml-metal" }));
-        // Csources.addMetalFrameworks(metal_lib);
 
-        // metal_lib.addCSourceFile(.{ .file = ctx.path(&.{ "ggml", "src", "ggml-metal", "ggml-metal.m" }), .flags = ctx.flags() });
-        // const metal_files = [_][]const u8{
-        //     "ggml-metal.metal",
-        //     "ggml-metal-impl.h",
-        // };
-        // // Compile the metal shader [requires xcode installed]
-        // const metal_compile = ctx.build.addSystemCommand(&.{
-        //     "xcrun",          "-sdk",                                                                      "macosx", "metal",
-        //     "-fno-fast-math", "-g",                                                                        "-c",     ctx.build.pathJoin(&.{ ctx.build.install_path, "metal", "ggml-metal.metal" }),
-        //     "-o",             ctx.build.pathJoin(&.{ ctx.build.install_path, "metal", "ggml-metal.air" }), "-I",     "llama.cpp/ggml/src",
-        // });
         const common_src = ctx.path(&.{ "ggml", "src", "ggml-common.h" });
         const common_dst = "ggml-common.h";
         const common_install_step = ctx.build.addInstallFile(common_src, common_dst);
-        // metal_compile.step.dependOn(&common_install_step.step);
-        // for (metal_files) |file| {
-        //     const src = ctx.path(&.{ "ggml", "src", "ggml-metal", file });
-        //     const dst = ctx.build.pathJoin(&.{ "metal", file });
-        //     const install_step = ctx.build.addInstallFile(src, dst);
-        //     metal_compile.step.dependOn(&install_step.step);
+
+        if (ctx.platform == .Metal) {
+            const metallib_compile = ctx.build.addSystemCommand(&.{
+                "xcrun", "-sdk", "macosx", "metallib", ctx.build.pathJoin(&.{ ctx.build.install_path, "metal", "ggml-metal.air" }), "-o", ctx.build.pathJoin(&.{ ctx.build.install_path, "metal", "default.metallib" }),
+            });
+            const metal_ctx = MetalContext.metalLibrary(ctx, common_install_step);
+            metallib_compile.step.dependOn(&metal_ctx.compile.step);
+            // Install the metal shader source file to bin directory
+            const metal_shader_install = ctx.build.addInstallBinFile(ctx.path(&.{ "ggml", "src", "ggml-metal", "ggml-metal.metal" }), "ggml-metal.metal");
+            const default_lib_install = ctx.build.addInstallBinFile(.{ .cwd_relative = ctx.build.pathJoin(&.{ ctx.build.install_path, "metal", "default.metallib" }) }, "default.metallib");
+            metal_shader_install.step.dependOn(&metallib_compile.step);
+            default_lib_install.step.dependOn(&metal_shader_install.step);
+            // Link the metal library with the main compilation
+            compile.linkLibrary(metal_ctx.lib);
+            compile.step.dependOn(&metal_ctx.lib.step);
+            compile.step.dependOn(&default_lib_install.step);
+        }
+        // if (ctx.platform == .Cuda){
+
         // }
-        const metallib_compile = ctx.build.addSystemCommand(&.{
-            "xcrun", "-sdk", "macosx", "metallib", ctx.build.pathJoin(&.{ ctx.build.install_path, "metal", "ggml-metal.air" }), "-o", ctx.build.pathJoin(&.{ ctx.build.install_path, "metal", "default.metallib" }),
-        });
-        const metal_ctx = MetalContext.metalLibrary(ctx, common_install_step);
-        metallib_compile.step.dependOn(&metal_ctx.compile.step);
-        // Install the metal shader source file to bin directory
-        const metal_shader_install = ctx.build.addInstallBinFile(ctx.path(&.{ "ggml", "src", "ggml-metal", "ggml-metal.metal" }), "ggml-metal.metal");
-        const default_lib_install = ctx.build.addInstallBinFile(.{ .cwd_relative = ctx.build.pathJoin(&.{ ctx.build.install_path, "metal", "default.metallib" }) }, "default.metallib");
-        metal_shader_install.step.dependOn(&metallib_compile.step);
-        default_lib_install.step.dependOn(&metal_shader_install.step);
-        // Link the metal library with the main compilation
-        compile.linkLibrary(metal_ctx.lib);
-        compile.step.dependOn(&metal_ctx.lib.step);
-        compile.step.dependOn(&default_lib_install.step);
 
         Csources.addGGMLSources(ctx, compile);
     }
