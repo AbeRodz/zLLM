@@ -42,13 +42,13 @@ pub const BuildContext = struct {
         };
     }
     /// just builds everything needed and links it to your target
-    pub fn link(ctx: *Self, comp: *CompileStep) void {
-        const lib = ctx.library();
+    pub fn link(ctx: *Self, comp: *CompileStep) !void {
+        const lib = try ctx.library();
         comp.linkLibrary(lib);
     }
 
     /// build single library containing everything
-    pub fn library(ctx: *Self) *CompileStep {
+    pub fn library(ctx: *Self) !*CompileStep {
         if (ctx.lib) |l| return l;
         const lib = ctx.build.addStaticLibrary(std.Build.StaticLibraryOptions{
             .name = "llama.cpp",
@@ -63,15 +63,19 @@ pub const BuildContext = struct {
             lib.root_module.addCMacro("GGML_METAL_USE_BF16", "ON");
             lib.root_module.addCMacro("GGML_METAL_EMBED_LIBRARY", "ON");
         }
-        ctx.addAll(lib);
+        if (ctx.platform == .Cuda) {
+            lib.root_module.addCMacro("DGGML_USE_CUDA", "");
+            lib.root_module.addCMacro("GGML_CUDA_USE_GRAPHS", "ON");
+        }
+        try ctx.addAll(lib);
         if (ctx.target.result.abi != .msvc)
             lib.root_module.addCMacro("_GNU_SOURCE", "");
         ctx.lib = lib;
         return lib;
     }
-    pub fn addAll(ctx: *Self, compile: *CompileStep) void {
+    pub fn addAll(ctx: *Self, compile: *CompileStep) !void {
         ctx.addBuildInfo(compile);
-        ctx.addGgml(compile);
+        try ctx.addGgml(compile);
         Csources.addLLama(ctx, compile);
     }
     /// zig module with translated headers
@@ -103,13 +107,16 @@ pub const BuildContext = struct {
     pub fn addBuildInfo(ctx: *Self, compile: *CompileStep) void {
         compile.addObject(ctx.build_info);
     }
-    pub fn addGgml(ctx: *Self, compile: *CompileStep) void {
+    pub fn addGgml(ctx: *Self, compile: *CompileStep) !void {
         ctx.common(compile);
         compile.addIncludePath(ctx.path(&.{ "ggml", "include" }));
         compile.addIncludePath(ctx.path(&.{ "ggml", "src" }));
 
         if (ctx.platform == .Metal) {
             compile.addIncludePath(ctx.path(&.{ "ggml", "src", "ggml-metal" }));
+        }
+        if (ctx.platform == .Cuda) {
+            compile.addIncludePath(ctx.path(&.{ "ggml", "src", "ggml-cuda" }));
         }
 
         compile.addIncludePath(ctx.path(&.{ "ggml", "src", "ggml-cpu" }));
@@ -137,11 +144,13 @@ pub const BuildContext = struct {
             compile.step.dependOn(&metal_ctx.lib.step);
             compile.step.dependOn(&default_lib_install.step);
         }
+
+        if (ctx.platform == .Cuda) {}
         // if (ctx.platform == .Cuda){
 
         // }
 
-        Csources.addGGMLSources(ctx, compile);
+        try Csources.addGGMLSources(ctx, compile);
     }
 
     pub fn flags(ctx: Self) []const []const u8 {

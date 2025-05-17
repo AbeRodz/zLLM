@@ -27,6 +27,61 @@ pub const llama_ggml_cpu_sources = &[_][]const u8{
     "amx/amx.cpp",
     "amx/mmq.cpp",
 };
+
+pub const llama_ggml_cuda_sources = &[_][]const u8{
+    "ggml-cuda.cu",
+    //"ggml-backend-impl.h",
+    // "ggml-common.h",
+};
+
+pub fn globCuhFilesComptime(
+    comptime dir_path: []const u8,
+) []const []const u8 {
+    const fs = std.fs;
+
+    var files: [60][]const u8 = undefined; // fixed max capacity
+
+    var count: usize = 0;
+
+    var dir = fs.cwd().openDir(dir_path, .{ .access_sub_paths = false, .iterate = true }) catch @panic("failed to open dir");
+    //defer (@as(*fs.Dir, @ptrCast(dir))).close();
+    defer dir.close();
+
+    var it = dir.iterate();
+
+    while (true) {
+        const entry = it.next() catch unreachable;
+        if (entry == null) break;
+
+        if (entry.?.kind == .file and std.mem.endsWith(u8, entry.?.name, ".cuh")) {
+            files[count] = entry.?.name;
+            // std.debug.print("src: {s}\n", .{files[count]});
+            count += 1;
+            if (count >= files.len) break; // prevent overflow
+        }
+    }
+
+    return files[0..count];
+}
+
+fn collectCuhFiles(b: *std.Build, allocator: std.mem.Allocator, dir_path: []const u8) !std.ArrayList(std.Build.LazyPath) {
+    var dir = try std.fs.cwd().openDir(dir_path, .{ .access_sub_paths = false, .iterate = true });
+    defer dir.close();
+
+    var list = std.ArrayList(std.Build.LazyPath).init(allocator);
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+
+    while (try walker.next()) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.basename, ".cuh")) {
+            const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.path });
+            const lazy = b.path(full_path);
+            try list.append(lazy);
+        }
+    }
+
+    return list;
+}
 pub const llama_ggml_metal_sources = &[_][]const u8{
     "ggml-metal",
 };
@@ -133,7 +188,7 @@ pub fn addLLama(ctx: *BuildContext, compile: *CompileStep) void {
     }
 }
 
-pub fn addGGMLSources(ctx: *BuildContext, compile: *CompileStep) void {
+pub fn addGGMLSources(ctx: *BuildContext, compile: *CompileStep) !void {
     for (llama_ggml_sources) |src| {
         compile.addCSourceFile(.{
             .file = ctx.path(&.{ "ggml", "src", src }),
@@ -145,6 +200,19 @@ pub fn addGGMLSources(ctx: *BuildContext, compile: *CompileStep) void {
             .file = ctx.path(&.{ "ggml", "src", "ggml-cpu", src }),
             .flags = ctx.flags(),
         });
+    }
+    if (ctx.platform == .Cuda) {
+        const cuhs = try collectCuhFiles(ctx.build, ctx.build.allocator, "llama.cpp/ggml/src/ggml-cuda");
+        for (cuhs.items) |src| {
+            //std.debug.print("cuhs: {s}\n", .{src});
+            compile.addIncludePath(src);
+        }
+        // for (llama_ggml_cuda_sources) |src| {
+        //     compile.addCSourceFile(.{
+        //         .file = ctx.path(&.{ "ggml", "src", "ggml-cuda", src }),
+        //         .flags = ctx.flags(),
+        //     });
+        // }
     }
 }
 

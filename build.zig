@@ -56,11 +56,11 @@ pub const Context = struct {
             .ggml_h_module = ggml_h_module,
         };
     }
-    pub fn link(self: *Self, comp: *CompileStep) void {
-        self.llama.link(comp);
+    pub fn link(self: *Self, comp: *CompileStep) !void {
+        try self.llama.link(comp);
     }
 };
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const platform = OsToPlatform(target, b);
@@ -85,7 +85,7 @@ pub fn build(b: *std.Build) void {
     exe.addIncludePath(ctx.llama.path(&.{ "ggml", "src" }));
     exe.want_lto = false;
     ctx.llama.common(exe);
-    ctx.link(exe);
+    try ctx.link(exe);
 
     const uuid = b.dependency("uuid", .{
         .target = ctx.options.target,
