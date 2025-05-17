@@ -24,6 +24,11 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          
+      - name: List ggml files
+        run: ls -R llama.cpp/ggml/src
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
