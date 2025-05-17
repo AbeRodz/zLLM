@@ -4,6 +4,7 @@ const Module = std.Build.Module;
 const BuildContext = @import("build_context.zig").BuildContext;
 const CompilerConfig = @import("build_platform.zig").CompilerConfig;
 const Platform = @import("build_platform.zig").Platform;
+const OsToPlatform = @import("build_platform.zig").OsToPlatform;
 const addCBuildSources = @import("build_csources.zig").addCBuildSources;
 const tokamak = @import("tokamak");
 
@@ -62,9 +63,10 @@ pub const Context = struct {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    std.debug.print("Target OS: {}\n", .{target.result.os});
+    const platform = OsToPlatform(target, b);
+    std.debug.print("Target OS: {}, platform: {}\n", .{ target.result.os, platform });
     var ctx = Context.init(b, .{
-        .platform = .Metal,
+        .platform = platform,
         .source_path = "",
         .target = target,
         .optimize = optimize,
