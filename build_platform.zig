@@ -6,6 +6,16 @@ pub const Platform = enum {
     Cpu,
 };
 
+pub fn OsToPlatform(target: std.Build.ResolvedTarget, build: *std.Build) Platform {
+    const os = target.result.os.tag;
+    const use_cuda = build.option(bool, "use-cuda", "Use CUDA backend") orelse false;
+    return switch (os) {
+        .macos => Platform.Metal,
+        .linux => if (use_cuda) Platform.Cuda else Platform.Cpu,
+        else => Platform.Cpu,
+    };
+}
+
 pub const CompilerConfig = struct {
     platform: Platform,
 
