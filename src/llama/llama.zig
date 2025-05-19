@@ -193,6 +193,148 @@ pub fn execute(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocator)
         fixed_buffer_allocator.reset();
     }
 }
+pub const StreamIter = struct {
+    ctx: *llama.struct_llama_context,
+    sampler: [*c]llama.struct_llama_sampler,
+    model: *llama.struct_llama_model,
+    allocator: std.mem.Allocator,
+    vocab: *const llama.struct_llama_vocab,
+    batch: llama.llama_batch,
+    is_done: bool = false,
+    prompt_token_count: i32,
+    completion_token_count: i32 = 0,
+
+    pub fn next(self: *StreamIter) !?[]const u8 {
+        if (self.is_done) return null;
+
+        const n_ctx_used = llama.llama_kv_self_used_cells(self.ctx);
+        if (n_ctx_used + self.batch.n_tokens > llama.llama_n_ctx(self.ctx)) {
+            self.is_done = true;
+            return null;
+        }
+
+        if (llama.llama_decode(self.ctx, self.batch) != 0) {
+            self.is_done = true;
+            return null;
+        }
+
+        const token = llama.llama_sampler_sample(self.sampler, self.ctx, -1);
+        if (llama.llama_vocab_is_eog(self.vocab, token)) {
+            self.is_done = true;
+            return null;
+        }
+        var buf: [4096]u8 = undefined;
+        const len = llama.llama_token_to_piece(self.vocab, token, &buf, buf.len, 0, true);
+        if (len < 0 or @as(usize, @intCast(len)) > buf.len) {
+            std.debug.print("Invalid len = {}\n", .{len});
+            self.is_done = true;
+            return null;
+        }
+        const slice = buf[0..@as(usize, @intCast(len))];
+        // const slice = self.allocator.dupe(u8, buf[0..@as(usize, @intCast(len))]) catch {
+        //     self.is_done = true;
+        //     return null;
+        // };
+        //const prompt_tokens = try allocator.alloc(i32, @as(usize, @intCast(n_prompt)));
+        const tokens = try std.heap.page_allocator.alloc(i32, 1);
+        tokens[0] = token;
+        const tok = @as([*c]i32, @ptrCast(tokens.ptr));
+        const batch = llama.llama_batch_get_one(tok, 1);
+        self.batch = batch;
+        //defer std.heap.page_allocator.free(tokens);
+        self.completion_token_count += 1;
+        return slice;
+    }
+
+    pub fn deinit(_: *StreamIter) void {
+        // No dynamic memory in struct currently might need in the future?
+    }
+};
+
+fn generateStream(
+    ctx: *llama.struct_llama_context,
+    smpl: [*c]llama.struct_llama_sampler,
+    model: *llama.struct_llama_model,
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    on_token: fn ([]const u8) anyerror!void,
+) !void {
+    const vocab = llama.llama_model_get_vocab(model);
+    const is_first = llama.llama_kv_self_used_cells(ctx) == 0;
+    const n_prompt = -llama.llama_tokenize(vocab, prompt.ptr, @as(i32, @intCast(prompt.len)), null, 0, is_first, true);
+
+    const prompt_tokens = try allocator.alloc(i32, @as(usize, @intCast(n_prompt)));
+    defer allocator.free(prompt_tokens);
+
+    if (llama.llama_tokenize(vocab, prompt.ptr, @as(i32, @intCast(prompt.len)), prompt_tokens.ptr, @as(i32, @intCast(prompt.len)), is_first, true) < 0) {
+        return error.TokenizationFailed;
+    }
+
+    var batch = llama.llama_batch_get_one(prompt_tokens.ptr, n_prompt);
+    var new_token_id: llama.llama_token = undefined;
+
+    while (true) {
+        const n_ctx_used = llama.llama_kv_self_used_cells(ctx);
+        if (n_ctx_used + batch.n_tokens > llama.llama_n_ctx(ctx)) break;
+
+        if (llama.llama_decode(ctx, batch) != 0) return error.DecodeFailed;
+
+        new_token_id = llama.llama_sampler_sample(smpl, ctx, -1);
+        if (llama.llama_vocab_is_eog(vocab, new_token_id)) break;
+
+        var buf: [4096]u8 = undefined;
+        const len = llama.llama_token_to_piece(vocab, new_token_id, &buf, buf.len, 0, true);
+        if (len < 0) return error.TokenToPieceFailed;
+
+        const slice = buf[0..@as(usize, @intCast(len))];
+        try on_token(slice);
+
+        batch = llama.llama_batch_get_one(&new_token_id, 1);
+    }
+}
+pub fn respondToPromptStream(
+    allocator: std.mem.Allocator,
+    model_name: []const u8,
+    n_ctx: u32,
+    prompt: []const u8,
+) !StreamIter {
+    const loaded = try registryRuntime.getOrLoadModel(allocator, model_name, n_ctx);
+    const tmpl = llama.llama_model_chat_template(loaded.model, null);
+    const sampler = llama_sampler();
+
+    const bytes_per_token = 4;
+    const headroom = 20;
+    const buffer_size = calculateBufferSize(n_ctx, bytes_per_token, headroom);
+    const backing_mem = try allocator.alloc(u8, buffer_size);
+
+    var fixed_buffer_allocator = std.heap.FixedBufferAllocator.init(backing_mem);
+    const fast_alloc = fixed_buffer_allocator.allocator();
+
+    const formatted = try allocator.alloc(u8, n_ctx);
+    try appendMessage(allocator, "user", prompt);
+    const chat_prompt = try applyChatTemplate(fast_alloc, tmpl, message_ring, formatted);
+
+    const vocab = llama.llama_model_get_vocab(loaded.model);
+    const is_first = llama.llama_kv_self_used_cells(loaded.ctx) == 0;
+    const n_prompt = -llama.llama_tokenize(vocab, chat_prompt.ptr, @as(i32, @intCast(chat_prompt.len)), null, 0, is_first, true);
+
+    const prompt_tokens = try allocator.alloc(i32, @as(usize, @intCast(n_prompt)));
+    if (llama.llama_tokenize(vocab, chat_prompt.ptr, @as(i32, @intCast(chat_prompt.len)), prompt_tokens.ptr, @as(i32, @intCast(chat_prompt.len)), is_first, true) < 0) {
+        return error.TokenizationFailed;
+    }
+
+    const batch = llama.llama_batch_get_one(prompt_tokens.ptr, n_prompt);
+
+    return StreamIter{
+        .ctx = loaded.ctx,
+        .sampler = sampler,
+        .model = loaded.model,
+        .allocator = allocator,
+        .vocab = vocab.?,
+        .batch = batch,
+        .prompt_token_count = n_prompt,
+    };
+}
 
 fn generate(
     ctx: *llama.struct_llama_context,

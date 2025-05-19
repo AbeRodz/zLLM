@@ -8,8 +8,8 @@
 
 - Written entirely in Zig
 - Integrated model registry (`registry_manifest.json`)
-- Supports model download, GGUF conversion, and inference
-- MacOS (Metal) support via llama.cpp
+- Supports model download, GGUF conversion, and inference via CLI and REST API.
+- MacOS (Metal) and Intel x86 support via llama.cpp
 - Currently supports OpenAI's chat completions, enough to use Python's OpenAI client library.
 
 ---
@@ -65,7 +65,7 @@ zig build run -- run gemma-3-1b
 ## 🌐 Run (API)
 Runs inference API:
 ```sh
-zig build run -- api-run
+zig build run -- serve
 ```
 
 ## ⚙️ Direct Binary Execution
@@ -79,7 +79,10 @@ You only need to run zig build once. You can then use the built binary directly:
 
 ## 🖥️ Supported Platforms
 
-Currently only macOS with Metal is supported.
+Currently only:
+- MacOS Apple Silicon.
+- Linux x86 (tested on Ubuntu)
+    - Other distros haven't been tested yet.
 
 Platform support is bound by build.zig and the capabilities of llama.cpp.
 
@@ -147,4 +150,42 @@ completion = client.chat.completions.create(
 
 print(completion.choices[0].content)
 # i dont know -> expected response given the example above.
+```
+
+### Stream support via SSE
+The following is a simple script to test streaming and estimate the token generation rate.
+
+
+```python
+import openai
+
+client = openai.OpenAI(
+  base_url="http://localhost:8080/v1/", # local zLLM server
+  api_key= "apiKey" # dummy apiKey
+)
+
+start_time = time.time()
+first_token_time = None
+token_count = 0
+
+response = client.chat.completions.create(
+    model = "gemma-3-1b",
+    messages=[{"role": "user", "content": "Tell me a story about a fox"}],
+    stream=True,
+)
+try:
+    for chunk in response:
+        now = time.time()
+        if first_token_time is None:
+            first_token_time = now
+            print(f"⏱ First token delay: {first_token_time - start_time:.3f}s")
+        token_count += 1
+        print(chunk.choices[0].delta.content, end='', flush=True)
+except Exception as err:
+    print(err)
+    pass
+end_time = time.time()
+duration = end_time - first_token_time
+print(f"\n\n📊 Tokens streamed: {token_count}")
+print(f"⚡ Throughput: {token_count / duration:.2f} tokens/sec"),
 ```

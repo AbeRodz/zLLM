@@ -59,7 +59,7 @@ fn run(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     try llama.execute(model_name, n_ctx, allocator);
 }
 
-fn ApiRun(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
+fn serve(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     const port_str = args.next() orelse "8080";
     const parsedPort = try std.fmt.parseInt(u16, port_str, 10);
     APIPresentation(parsedPort);
@@ -89,8 +89,8 @@ pub fn init() !void {
         printUsage();
     } else if (std.mem.eql(u8, command, "run")) {
         try run(&args, allocator);
-    } else if (std.mem.eql(u8, command, "api-run")) {
-        try ApiRun(&args, allocator);
+    } else if (std.mem.eql(u8, command, "serve")) {
+        try serve(&args, allocator);
     } else {
         std.debug.print("Unknown command: {s}\n", .{command});
         printUsage();
@@ -112,13 +112,15 @@ fn printUsage() void {
         \\  zig build run -- <command> <model-name> [threads]
         \\
         \\Commands:
-        \\  get   Downloads a model from HuggingFace
+        \\  get        Downloads a model from HuggingFace
         \\  convert    Converts a downloaded model to GGUF
+        \\  serve      Serves http server 
         \\  help       Show this message
         \\
         \\Examples:
-        \\  zig build run -- download vit-base 8
+        \\  zig build run -- get vit-base 8
         \\  zig build run -- convert vit-base
+        \\  zig build run -- serve
         \\
     , .{});
 }
