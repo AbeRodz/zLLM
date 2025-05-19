@@ -128,7 +128,6 @@ pub fn decodeMessages(allocator: std.mem.Allocator, body: []const u8) ![]Message
             .content = content,
         };
     }
-    std.debug.print("length: {d}\n", .{messages.len});
     return messages;
 }
 
@@ -168,12 +167,13 @@ pub fn decodeCompletionRequest(allocator: std.mem.Allocator, body: []const u8) !
     const root = parsed.value;
     const stream_opt = root.object.get("stream_options");
     const response_fmt = root.object.get("response_format");
+    const stop_val = root.object.get("stop");
     const model = try getFieldAs([]const u8, root, "model", allocator);
     const messages = try decodeMessages(allocator, body);
     const stream = try getFieldAs(bool, root, "stream", allocator);
     const max_tokens = try getFieldAs(i32, root, "max_tokens", allocator);
     const seed = try getFieldAs(i32, root, "seed", allocator);
-    const stop = try decodeStop(root.object.get("stop").?, allocator);
+    const stop = if (stop_val) |val| try decodeStop(val, allocator) else null;
     const stream_options = if (stream_opt) |val| try decodeStreamOptions(val) else null;
     const temperature = try getFieldAs(f64, root, "temperature", allocator);
     const frequency_penalty = try getFieldAs(f64, root, "frequency_penalty", allocator);

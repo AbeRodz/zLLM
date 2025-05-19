@@ -66,16 +66,22 @@ pub const Message = struct {
     tool_calls: ?[]ToolCall = null,
 };
 
+pub const ResponseMessage = struct {
+    content: []const u8,
+    tool_calls: ?[]ToolCall = null,
+    role: []const u8,
+};
+
 pub const Choice = struct {
     finish_reason: ?[]const u8,
     index: i32,
-    message: Message,
+    message: ResponseMessage,
 };
 
-const ChunkChoice = struct {
-    index: i32,
-    delta: Message,
+pub const ChunkChoice = struct {
     finish_reason: ?[]const u8,
+    index: i32,
+    delta: ResponseMessage,
 };
 
 pub const CompleteChunkChoice = struct {
@@ -134,14 +140,14 @@ pub const ChatCompletionResponse = struct {
     usage: Usage,
 };
 
-const ChatCompletionChunk = struct {
+pub const ChatCompletionChunk = struct {
     id: []const u8,
-    object: []const u8,
+    choices: []ChunkChoice,
     created: i64,
     model: []const u8,
     system_fingerprint: []const u8,
-    choices: []ChunkChoice,
-    usage: ?*Usage,
+    object: []const u8 = "chat.completion",
+    usage: Usage,
 };
 
 pub const CompletionRequest = struct {
