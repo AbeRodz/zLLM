@@ -2,6 +2,9 @@
 
 **zLLM** is a lightweight inference server written in [Zig](https://ziglang.org/) for managing and running LLMs. It supports downloading models from Hugging Face, converting them to the GGUF format, and executing inference using [llama.cpp](https://github.com/ggerganov/llama.cpp).
 
+![Demo](assets/demo.gif)
+
+
 ---
 
 ## ✨ Features
