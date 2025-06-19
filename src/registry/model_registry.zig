@@ -36,6 +36,19 @@ pub const ModelInfo = struct {
         }
         return true;
     }
+    pub fn loadGGUFModelBuffer(self: ModelInfo, allocator: std.mem.Allocator) ![]u8 {
+        if (self.files.len == 0) return error.UnknownModel;
+        const path = try self.localFilePath(self.name, "model.gguf");
+        const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+        defer file.close();
+
+        const file_size = try file.getEndPos();
+        const buffer = try allocator.alloc(u8, file_size);
+
+        _ = try file.readAll(buffer);
+
+        return buffer;
+    }
 };
 
 pub fn getCacheDir(allocator: std.mem.Allocator) ![]u8 {
