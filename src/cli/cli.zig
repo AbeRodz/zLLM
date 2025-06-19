@@ -5,6 +5,7 @@ const gguf = @import("../llama/gguf_converter.zig");
 const llama = @import("../llama/llama.zig");
 const tk = @import("tokamak");
 const api = @import("../api/api.zig");
+const ggufType = @import("../ggml/gguf.zig");
 
 fn get(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     const model_name = args.next() orelse return error.InvalidUsage;
@@ -24,6 +25,17 @@ fn get(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
         return error.UnknownModel;
     }
     try client.downloader(model.?, allocator);
+}
+
+fn read(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
+    const model_name = args.next() orelse return error.InvalidUsage;
+    try ggufType.read(model_name, allocator);
+}
+
+fn ggufInfo(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
+    const model_name = args.next() orelse return error.InvalidUsage;
+
+    try ggufType.describe(model_name, allocator);
 }
 
 fn convert(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
@@ -68,8 +80,9 @@ fn serve(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
 }
 
 pub fn init() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     var args = std.process.args();
     _ = args.skip();
@@ -91,6 +104,10 @@ pub fn init() !void {
         try run(&args, allocator);
     } else if (std.mem.eql(u8, command, "serve")) {
         try serve(&args, allocator);
+    } else if (std.mem.eql(u8, command, "read")) {
+        try read(&args, allocator);
+    } else if (std.mem.eql(u8, command, "describe")) {
+        try ggufInfo(&args, allocator);
     } else {
         std.debug.print("Unknown command: {s}\n", .{command});
         printUsage();
