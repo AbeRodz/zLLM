@@ -6,7 +6,8 @@ const llama = @import("../llama/llama.zig");
 const tk = @import("tokamak");
 const api = @import("../api/api.zig");
 const ggufType = @import("../ggml/gguf.zig");
-
+const safetensors = @import("../safetensors/tensor.zig");
+const converter = @import("../safetensors/convert.zig");
 fn get(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     const model_name = args.next() orelse return error.InvalidUsage;
     const threads = try getOptionalThreadArg(args);
@@ -30,6 +31,14 @@ fn get(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
 fn read(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     const model_name = args.next() orelse return error.InvalidUsage;
     try ggufType.read(model_name, allocator);
+}
+fn readSafeTensors(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
+    const model_name = args.next() orelse return error.InvalidUsage;
+    try safetensors.read(model_name, allocator);
+}
+fn convertSafeTensors(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
+    const model_name = args.next() orelse return error.InvalidUsage;
+    try converter.convert(model_name, "./model.gguf", allocator);
 }
 
 fn ggufInfo(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
@@ -106,6 +115,10 @@ pub fn init() !void {
         try serve(&args, allocator);
     } else if (std.mem.eql(u8, command, "read")) {
         try read(&args, allocator);
+    } else if (std.mem.eql(u8, command, "read-safetensors")) {
+        try readSafeTensors(&args, allocator);
+    } else if (std.mem.eql(u8, command, "convert-safetensors")) {
+        try convertSafeTensors(&args, allocator);
     } else if (std.mem.eql(u8, command, "describe")) {
         try ggufInfo(&args, allocator);
     } else {

@@ -68,7 +68,11 @@ pub const GGML = struct {
         // Read magic number (first 4 bytes)
         const magic_bytes = try reader.readBytes(4);
         const magic = std.mem.readVarInt(u32, magic_bytes, .little);
+        const size = @sizeOf(ContainerGGUF);
+        const alignment = @alignOf(ContainerGGUF);
 
+        std.debug.print("ContainerGGUF size: {} bytes\n", .{size});
+        std.debug.print("ContainerGGUF alignment: {} bytes\n", .{alignment});
         // Pick endian and initialize GGUF container
         var container: ContainerGGUF = switch (magic) {
             FILE_MAGIC_GGUF_LE => ContainerGGUF.init(.little, max_array_size),

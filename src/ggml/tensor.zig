@@ -6,9 +6,9 @@ const TensorTypeString = @import("types.zig").String;
 
 pub const Tensor = struct {
     name: []const u8,
-    kind: u32,
-    offset: u64,
     shape: []u64,
+    offset: u64,
+    kind: u32,
 
     const Self = @This();
 
