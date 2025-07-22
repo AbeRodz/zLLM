@@ -9,7 +9,7 @@
       ]
     },
     {
-        "name":"gemma-3-1b",
+        "name":"gemma3",
         "base_uri": "https://huggingface.co/google/gemma-3-1b-it/resolve/main/",
         "files":[
             "tokenizer.json",

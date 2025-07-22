@@ -14,9 +14,8 @@ const GGUF = struct {
     kv: KV,
     tensors: Tensors,
     parameters: ?u64 = undefined,
-    alignment: ?u32 = undefined,
     tensorOffset: ?u64 = undefined,
-    scratch: [16 << 10]u8 = undefined,
+    alignment: ?u32 = undefined,
 
     const Self = @This();
     pub fn init(container: *ContainerGGUF, allocator: std.mem.Allocator) Self {
@@ -38,30 +37,31 @@ const GGUF = struct {
 
     pub fn numTensor(self: *Self) u64 {
         switch (self.container.version) {
-            1 => return @as(u64, @intCast(self.container.v1.num_tensor)),
-            2 => return self.container.v2.num_tensor,
-            else => return self.container.v3.num_tensor,
+            1 => return @as(u64, @intCast(self.container.version_data.v1.num_tensor)),
+            2 => return self.container.version_data.v2.num_tensor,
+            else => return self.container.version_data.v3.num_tensor,
         }
     }
     pub fn numKV(self: *Self) u64 {
         switch (self.container.version) {
-            1 => return @as(u64, @intCast(self.container.v1.num_kv)),
-            2 => return self.container.v2.num_kv,
-            else => return self.container.v3.num_kv,
+            1 => return @as(u64, @intCast(self.container.version_data.v1.num_kv)),
+            2 => return self.container.version_data.v2.num_kv,
+            else => return self.container.version_data.v3.num_kv,
         }
     }
 
     pub fn decode(llm: *Self, reader: *FileReader, allocator: std.mem.Allocator) !void {
         // decode key-values
         var i: usize = 0;
-        try llm.kv.KV.ensureTotalCapacity(@as(u32, @intCast(llm.numKV())));
+        const n_kv = llm.numKV();
+        try llm.kv.KV.ensureTotalCapacity(@as(u32, @intCast(n_kv)));
 
-        while (@as(u64, @intCast(i)) < llm.numKV()) : (i += 1) {
+        while (@as(u64, @intCast(i)) < n_kv) : (i += 1) {
             const k = try readGGUFStringFixed(reader, llm, allocator);
             const type_id_u32 = try readGGUF(u32, reader, llm);
-            // std.debug.print("Key: {s}\n", .{k});
-            // std.debug.print("Type ID: {} (0x{x})\n", .{ type_id_u32, type_id_u32 });
-            // std.debug.print("Next pos: {}\n", .{reader.pos});
+            std.debug.print("Key: {s}\n", .{k});
+            std.debug.print("Type ID: {} (0x{x})\n", .{ type_id_u32, type_id_u32 });
+            std.debug.print("Next pos: {}\n", .{reader.pos});
             const type_id = try std.meta.intToEnum(GGUFDataType, type_id_u32);
             var v: Value = undefined;
             switch (type_id) {
@@ -81,12 +81,13 @@ const GGUF = struct {
             }
 
             try llm.kv.KV.put(k, v);
-            //std.debug.print("Total KVs decoded: {}/{}\n", .{ i, llm.numKV() });
+            std.debug.print("Total KVs decoded: {}/{}\n", .{ i, n_kv });
         }
 
         // decode tensors
         var t: usize = 0;
-        while (@as(u64, @intCast(t)) < llm.numTensor()) : (t += 1) {
+        const n_tensors = llm.numTensor();
+        while (@as(u64, @intCast(t)) < n_tensors) : (t += 1) {
             const name = try readGGUFStringFixed(reader, llm, allocator);
             const dims = try readGGUF(u32, reader, llm);
 
@@ -160,32 +161,6 @@ pub fn readGGUF(comptime T: type, reader: *FileReader, llm: *const GGUF) !T {
         },
         else => return error.UnsupportedType,
     }
-}
-
-pub fn readGGUFString(reader: *FileReader, llm: *GGUF, allocator: std.mem.Allocator) ![]u8 {
-    if (llm.container.version == 1) {
-        return try readGGUFV1String(reader, llm, allocator);
-    }
-
-    const len_bytes = try reader.readBytes(8);
-    var len_buf: [8]u8 = undefined;
-    @memcpy(&len_buf, len_bytes);
-    const length = std.mem.readInt(u64, &len_buf, llm.container.byte_order);
-
-    const len_usize = @as(usize, @intCast(length));
-
-    // bound check to prevent weird strings
-    if (len_usize == 0 or len_usize > 1_048_576) // >1MB
-        return error.InvalidStringLength;
-
-    const str_buf: []u8 = if (len_usize > llm.scratch.len)
-        try allocator.alloc(u8, len_usize)
-    else
-        llm.scratch[0..len_usize];
-
-    const raw = try reader.readBytes(len_usize);
-    @memcpy(str_buf, raw);
-    return str_buf;
 }
 
 pub fn readGGUFStringFixed(reader: *FileReader, llm: *GGUF, allocator: std.mem.Allocator) ![]u8 {
@@ -322,10 +297,7 @@ pub fn read(model_name: []const u8, allocator: std.mem.Allocator) !void {
     // }
 
 }
-
-pub const ContainerGGUF = struct {
-    byte_order: std.builtin.Endian,
-    version: u32,
+const VersionData = union(enum) {
     v1: struct {
         num_tensor: u32,
         num_kv: u32,
@@ -338,6 +310,12 @@ pub const ContainerGGUF = struct {
         num_tensor: u64,
         num_kv: u64,
     },
+};
+
+pub const ContainerGGUF = struct {
+    version: u32,
+    byte_order: std.builtin.Endian,
+    version_data: VersionData,
     max_array_size: usize,
 
     const Self = @This();
@@ -345,9 +323,7 @@ pub const ContainerGGUF = struct {
         return Self{
             .byte_order = byte_order,
             .version = 0,
-            .v1 = .{ .num_tensor = 0, .num_kv = 0 },
-            .v2 = .{ .num_tensor = 0, .num_kv = 0 },
-            .v3 = .{ .num_tensor = 0, .num_kv = 0 },
+            .version_data = VersionData{ .v3 = .{ .num_tensor = 0, .num_kv = 0 } },
             .max_array_size = max_array_size,
         };
     }
@@ -359,37 +335,40 @@ pub const ContainerGGUF = struct {
 
         switch (self.version) {
             1 => {
-                self.v1.num_tensor = switch (self.byte_order) {
+                self.version_data.v1.num_tensor = switch (self.byte_order) {
                     .little => std.mem.littleToNative(u32, try reader.readU32()),
                     .big => std.mem.bigToNative(u32, try reader.readU32()),
                 };
-                self.v1.num_kv = switch (self.byte_order) {
+                self.version_data.v1.num_kv = switch (self.byte_order) {
                     .little => std.mem.littleToNative(u32, try reader.readU32()),
                     .big => std.mem.bigToNative(u32, try reader.readU32()),
                 };
             },
             2 => {
-                self.v2.num_tensor = switch (self.byte_order) {
+                self.version_data.v2.num_tensor = switch (self.byte_order) {
                     .little => std.mem.littleToNative(u64, try reader.readU64()),
                     .big => std.mem.bigToNative(u64, try reader.readU64()),
                 };
-                self.v2.num_kv = switch (self.byte_order) {
+                self.version_data.v2.num_kv = switch (self.byte_order) {
                     .little => std.mem.littleToNative(u64, try reader.readU64()),
                     .big => std.mem.bigToNative(u64, try reader.readU64()),
                 };
             },
             else => {
-                self.v3.num_tensor = switch (self.byte_order) {
+                self.version_data.v3.num_tensor = switch (self.byte_order) {
                     .little => std.mem.littleToNative(u64, try reader.readU64()),
                     .big => std.mem.bigToNative(u64, try reader.readU64()),
                 };
-                self.v3.num_kv = switch (self.byte_order) {
+                self.version_data.v3.num_kv = switch (self.byte_order) {
                     .little => std.mem.littleToNative(u64, try reader.readU64()),
                     .big => std.mem.bigToNative(u64, try reader.readU64()),
                 };
             },
         }
-
+        const gguf_size = @sizeOf(GGUF);
+        const gguf_alignment = @alignOf(GGUF);
+        std.debug.print("GGUF size: {} bytes\n", .{gguf_size});
+        std.debug.print("GGUF alignment: {} bytes\n", .{gguf_alignment});
         var model = GGUF.init(self, allocator);
         try model.decode(reader, allocator);
         return model;
