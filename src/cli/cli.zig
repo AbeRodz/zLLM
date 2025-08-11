@@ -7,7 +7,7 @@ const tk = @import("tokamak");
 const api = @import("../api/api.zig");
 const ggufType = @import("../ggml/gguf.zig");
 const safetensors = @import("../safetensors/tensor.zig");
-const converter = @import("../safetensors/convert.zig");
+const converter = @import("../safetensors/gguf/convert.zig");
 fn get(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     const model_name = args.next() orelse return error.InvalidUsage;
     const threads = try getOptionalThreadArg(args);

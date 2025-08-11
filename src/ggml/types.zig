@@ -27,7 +27,7 @@ pub const TensorType = enum(u32) {
     TensorTypeQ5_1,
     TensorTypeQ8_0,
     TensorTypeQ8_1,
-    TensorTypeQ2_K,
+    TensorTypeQ2_K, // 10
     TensorTypeQ3_K,
     TensorTypeQ4_K,
     TensorTypeQ5_K,
@@ -37,7 +37,7 @@ pub const TensorType = enum(u32) {
     tensorTypeIQ2_XS,
     tensorTypeIQ3_XXS,
     tensorTypeIQ1_S,
-    tensorTypeIQ4_NL,
+    tensorTypeIQ4_NL, // 20
     tensorTypeIQ3_S,
     tensorTypeIQ2_S,
     tensorTypeIQ4_XS,
@@ -47,7 +47,7 @@ pub const TensorType = enum(u32) {
     TensorTypeI64,
     TensorTypeF64,
     tensorTypeIQ1_M,
-    TensorTypeBF16,
+    TensorTypeBF16, // 30
     tensorTypeQ4_0_4_4, // unused by GGML
     tensorTypeQ4_0_4_8, // unused by GGML
     tensorTypeQ4_0_8_8, // unused by GGML

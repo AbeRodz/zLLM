@@ -13,8 +13,8 @@ pub const TokenEntry = struct {
 
 pub const TokenizerData = struct {
     tokens: []TokenEntry,
-    special_tokens: std.StringHashMap(usize),
-    add_special_tokens: std.StringHashMap(bool),
+    special_tokens: std.StringArrayHashMap(usize),
+    add_special_tokens: std.StringArrayHashMap(bool),
     chat_template: []const u8,
 };
 
@@ -44,7 +44,7 @@ pub fn parseTokenizerJson(allocator: std.mem.Allocator, path: []const u8) !Token
     const special_tokens_obj = root_obj.get("special_tokens");
 
     var tokens = std.ArrayList(TokenEntry).init(allocator);
-    var special_tokens = std.StringHashMap(usize).init(allocator);
+    var special_tokens = std.StringArrayHashMap(usize).init(allocator);
 
     // Parse "tokens"
     var iter = tokens_obj.object.iterator();
@@ -89,7 +89,7 @@ pub fn parseTokenizerJson(allocator: std.mem.Allocator, path: []const u8) !Token
     }
     const add_special_tokens_obj = root_obj.get("add_special_tokens");
 
-    var add_special_tokens = std.StringHashMap(bool).init(allocator);
+    var add_special_tokens = std.StringArrayHashMap(bool).init(allocator);
     if (add_special_tokens_obj) |obj| {
         if (obj == .object) {
             var add_st_iter = obj.object.iterator();
