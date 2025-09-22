@@ -1,5 +1,16 @@
 const std = @import("std");
 const TensorType = @import("../ggml/types.zig").TensorType;
+const TensorInfo = @import("./tensor_info.zig").TensorInfo;
+
+pub const TensorEntry = struct {
+    name: []const u8,
+    info: TensorInfo,
+};
+
+pub const OffsetEntry = struct {
+    name: []const u8,
+    index: usize,
+};
 
 pub fn mapDtypeToGGML(dtype: []const u8) !TensorType {
     if (std.mem.eql(u8, dtype, "F32")) return TensorType.TensorTypeF32;

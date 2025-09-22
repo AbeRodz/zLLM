@@ -6,7 +6,7 @@ const llama = @import("../llama/llama.zig");
 const tk = @import("tokamak");
 const api = @import("../api/api.zig");
 const ggufType = @import("../ggml/gguf.zig");
-const safetensors = @import("../safetensors/tensor.zig");
+const safetensors = @import("../safetensors/safetensors.zig");
 const converter = @import("../safetensors/gguf/convert.zig");
 fn get(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     const model_name = args.next() orelse return error.InvalidUsage;

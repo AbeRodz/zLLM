@@ -59,9 +59,10 @@ const GGUF = struct {
         while (@as(u64, @intCast(i)) < n_kv) : (i += 1) {
             const k = try readGGUFStringFixed(reader, llm, allocator);
             const type_id_u32 = try readGGUF(u32, reader, llm);
-            std.debug.print("Key: {s}\n", .{k});
-            std.debug.print("Type ID: {} (0x{x})\n", .{ type_id_u32, type_id_u32 });
-            std.debug.print("Next pos: {}\n", .{reader.pos});
+            const stdout = std.io.getStdOut().writer();
+            stdout.print("Key: {s}\n", .{k}) catch {};
+            stdout.print("Type ID: {} (0x{x})\n", .{ type_id_u32, type_id_u32 }) catch {};
+            stdout.print("Next pos: {}\n", .{reader.pos}) catch {};
             const type_id = try std.meta.intToEnum(GGUFDataType, type_id_u32);
             var v: Value = undefined;
             switch (type_id) {
@@ -79,9 +80,11 @@ const GGUF = struct {
                 .ggufTypeString => v = .{ .str = try readGGUFStringFixed(reader, llm, allocator) },
                 .ggufTypeArray => v = try readGGUFArray(llm, reader, allocator),
             }
-
+            // if (type_id == .ggufTypeArray) {
+            //     stdout.print("Value: Array of type {any}\n", .{v}) catch {};
+            // }
             try llm.kv.KV.put(k, v);
-            std.debug.print("Total KVs decoded: {}/{}\n", .{ i, n_kv });
+            stdout.print("Total KVs decoded: {}/{}\n", .{ i, n_kv }) catch {};
         }
 
         // decode tensors
@@ -98,7 +101,7 @@ const GGUF = struct {
 
             const kind = try readGGUF(u32, reader, llm);
             const offset = try readGGUF(u64, reader, llm);
-            std.debug.print("Key: {s}\n", .{name});
+            //            std.debug.print("Key: {s} Kind:{d} Offset:{d} Dims:{d}\n", .{ name, kind, offset, dims });
 
             var tensor = Tensor{
                 .name = name,
@@ -119,9 +122,15 @@ const GGUF = struct {
         const padding = ggufPadding(offset, alignment);
         llm.tensorOffset = offset + padding;
 
-        for (llm.tensors.items.items) |tensor| {
+        for (llm.tensors.items.items, 0..) |tensor, idx| {
+            std.debug.print("Tensor:{s}, idx:{d}\n", .{ tensor.name, idx });
             const cur_offset = @as(u64, @intCast(reader.pos));
             const pad = ggufPadding(cur_offset, alignment);
+            //std.debug.print("currentOffset:{d} currentPad:{d}\n", .{ cur_offset, pad });
+            // if (idx == 339) {
+            //     _ = try reader.readBytes(@as(usize, @intCast(pad)));
+            //     _ = try reader.readBytes(@as(usize, @intCast(tensor.size())));
+            // }
             _ = try reader.readBytes(@as(usize, @intCast(pad)));
             _ = try reader.readBytes(@as(usize, @intCast(tensor.size())));
         }
@@ -261,8 +270,10 @@ pub fn readGGUFArray(llm: *GGUF, reader: *FileReader, allocator: std.mem.Allocat
 }
 
 pub fn readGGUFArrayData(comptime T: type, llm: *GGUF, reader: *FileReader, buf: []T) ![]T {
+    const stdout = std.io.getStdOut().writer();
     for (buf) |*item| {
         item.* = try readGGUF(T, reader, llm);
+        stdout.print("item: {any}\n", .{item.*}) catch {};
     }
     return buf;
 }

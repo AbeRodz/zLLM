@@ -1,6 +1,6 @@
 const std = @import("std");
 const GGUFWriter = @import("../../ggml/writer.zig").GGUFWriter;
-const parseTokenizerJson = @import("../../ggml/tokenizer.zig").parseTokenizerJson;
+const parseTokenizerJson = @import("../../ggml/tokenizer.zig").parseTokenizerJsonV2;
 
 pub fn modelWeightCountRoundedNotation(
     comptime min_digits: usize,
@@ -180,7 +180,7 @@ pub fn writeGeneralMetadata(
         .{ "general.architecture", GeneralTag{ .str = architecture } },
         .{ "general.type", GeneralTag{ .str = "model" } },
         .{ "general.name", GeneralTag{ .str = "Gemma3" } }, // change
-        .{ "general.basename", GeneralTag{ .str = "gemma-3" } },
+        //.{ "general.basename", GeneralTag{ .str = "gemma-3" } },
         .{ "general.size_label", GeneralTag{ .str = "1000M" } }, // should be 1B
         //.{ "general.file_type", GeneralTag{ .u32 = 1 } },
         //.{ "general.quantization_version", GeneralTag{ .u32 = quant_version } },

@@ -1,12 +1,12 @@
 const std = @import("std");
 const StreamIter = @import("../llama/llama.zig").StreamIter;
-const completions = @import("completions.zig");
-const StreamOptions = @import("completions.zig").StreamOptions;
-const ResponseMessage = @import("completions.zig").ResponseMessage;
-const ChunkChoice = @import("completions.zig").ChunkChoice;
-const Content = @import("completions.zig").Content;
-const ChatCompletionRequest = @import("completions.zig").ChatCompletionRequest;
-const ChatCompletionChunk = @import("completions.zig").ChatCompletionChunk;
+const completions = @import("models/completions.zig");
+const StreamOptions = @import("models/completions.zig").StreamOptions;
+const ResponseMessage = @import("models/completions.zig").ResponseMessage;
+const ChunkChoice = @import("models/completions.zig").ChunkChoice;
+const Content = @import("models/completions.zig").Content;
+const ChatCompletionRequest = @import("models/completions.zig").ChatCompletionRequest;
+const ChatCompletionChunk = @import("models/completions.zig").ChatCompletionChunk;
 const llama = @import("../llama/llama.zig");
 
 pub const CompletionStreamer = struct {
@@ -22,15 +22,11 @@ pub const CompletionStreamer = struct {
         };
     }
 
-    pub fn next(self: *CompletionStreamer) !?ChatCompletionChunk {
-        const maybeChunk = try self.iter.next();
+    pub inline fn next(self: *CompletionStreamer) !?ChatCompletionChunk {
+        const maybeChunk = try nosuspend self.iter.next();
 
         if (maybeChunk) |chunk| {
-            const choices = try std.heap.page_allocator.alloc(ChunkChoice, 1);
-            const stdout = std.io.getStdOut().writer();
-            //try stdout.print("{s}", .{chunk});
-
-            choices[0] = ChunkChoice{
+            const choice: ChunkChoice = .{
                 .delta = ResponseMessage{
                     .content = chunk,
                     .role = "assistant",
@@ -38,7 +34,7 @@ pub const CompletionStreamer = struct {
                 .index = 0,
                 .finish_reason = null,
             };
-            try stdout.print("{s}", .{choices[0].delta.content});
+            const choices = [_]ChunkChoice{choice};
             return completions.ChatCompletionChunk{
                 .id = "chatcmpl-stream",
                 .choices = choices,
