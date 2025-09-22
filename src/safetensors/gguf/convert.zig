@@ -4,15 +4,14 @@ const Value = @import("../../ggml/KV.zig").Value;
 const registry = @import("../../registry/model_registry.zig");
 const TensorNameMap = @import("../../ggml/tensor_map.zig").TensorNameMap;
 const ModelArch = @import("../../ggml/constants.zig").ModelArch;
-const Metadata = @import("../tensor.zig").Metadata;
-const TensorInfo = @import("../tensor.zig").TensorInfo;
+const Metadata = @import("../metadata.zig").Metadata;
+const TensorInfo = @import("../tensor_info.zig").TensorInfo;
 const utils = @import("utils.zig");
 const quant = @import("quant.zig");
 const ParseTensorType = @import("../../ggml/types.zig").ParseTensorType;
 const TypeSize = @import("../../ggml/types.zig").TypeSize;
 const mapDtypeToGGML = @import("../types.zig").mapDtypeToGGML;
-const parseSafetensorsFromBuffer = @import("../tensor.zig").parseSafetensorsFromBuffer;
-const parseSafetensorsFromBufferV2 = @import("../tensor.zig").parseSafetensorsFromBufferV2;
+const parseSafetensorsFromBuffer = @import("../safetensors.zig").parseSafetensorsFromBuffer;
 const ggufPadding = @import("../../ggml/gguf.zig").ggufPadding;
 const getTensorNameMap = @import("../../ggml/tensor_map.zig").getTensorNameMap;
 const writeSentencePieceTokenizerVocab = @import("general.zig").writeSentencePieceTokenizerVocab;
@@ -25,7 +24,7 @@ fn writeGGUFHeader(writer: *GGUFWriter, metadata: *Metadata) !void {
     try writer.writeU32(version);
     try writer.writeU64(@as(u64, metadata.tensors.items.len));
     // TODO fix dynamic counts
-    const general_kv_count: u64 = 6;
+    const general_kv_count: u64 = 5;
     const tokenizer_kv_count: u64 = 13;
     const metadata_kv_count = @as(u64, metadata.metadata.count());
     const total_kv_count = general_kv_count + tokenizer_kv_count + metadata_kv_count;
@@ -43,6 +42,157 @@ fn writeExtraMetadataKV(writer: *GGUFWriter, metadata: *Metadata) !void {
         const val = entry.value_ptr.*;
         try utils.writeKeyValue(writer, key, val);
     }
+}
+
+pub fn prepare_tensorsV3(
+    allocator: std.mem.Allocator,
+    metadata: *Metadata,
+    safetensors_buffer: []const u8,
+    writer: *GGUFWriter,
+    out_file: *std.fs.File,
+) !void {
+    const alignment: u64 = 32;
+
+    const block_count_val = metadata.get(allocator, "block_count") orelse {
+        return error.MissingBlockCount;
+    };
+    const block_count: u32 = block_count_val.u32;
+
+    var tensor_map = try getTensorNameMap(allocator, ModelArch.GEMMA3, block_count);
+    const offkeys = try metadata.offsetKeys(allocator);
+
+    const OffsetPatch = struct {
+        tensor_index: usize,
+        pos_in_file: usize,
+        tensor_info: *const TensorInfo,
+        name: []const u8,
+    };
+    var offset_patch_list = std.ArrayList(OffsetPatch).init(allocator);
+    defer offset_patch_list.deinit();
+
+    // 1) Write tensor headers
+    for (offkeys, 0..) |entry, index| {
+        const name = utils.truncate_name(entry);
+        const new_name = try tensor_map.get_name(allocator, name, &[_][]const u8{ ".weight", ".bias" });
+        const tensor = &metadata.tensors.items[index];
+
+        try writer.writeString(new_name.?);
+
+        var shape_to_write = tensor.shape;
+        if (std.mem.endsWith(u8, new_name.?, ".weight") and !std.mem.endsWith(u8, new_name.?, "_norm.weight")) {
+            if (shape_to_write.len >= 2) {
+                const tmp = shape_to_write[0];
+                shape_to_write[0] = shape_to_write[1];
+                shape_to_write[1] = tmp;
+            }
+        }
+
+        try writer.writeU32(@as(u32, @intCast(shape_to_write.len)));
+        for (shape_to_write) |dim| {
+            try writer.writeU64(dim);
+        }
+
+        var out_dtype: []const u8 = "F16";
+        if (std.mem.endsWith(u8, new_name.?, "_norm.weight")) {
+            out_dtype = "F32"; // override header dtype for norms
+        }
+
+        const kind = @as(u32, @intCast(@intFromEnum(try mapDtypeToGGML(out_dtype))));
+        try writer.writeU32(kind);
+
+        const offset_placeholder_pos = writer.position;
+        try writer.writeU64(0);
+
+        try offset_patch_list.append(.{
+            .tensor_index = index,
+            .pos_in_file = offset_placeholder_pos,
+            .tensor_info = tensor,
+            .name = new_name.?,
+        });
+    }
+
+    // 2) Align and record data base
+    try writer.writePadding(alignment);
+    const data_base = writer.position;
+
+    // 3) Write tensor data and patch offsets
+    for (offset_patch_list.items) |patch| {
+        const tensor = patch.tensor_info;
+        const actual_offset = @as(u64, writer.position - data_base);
+
+        // Patch header offset
+        const current_pos = writer.position;
+        try out_file.seekTo(@intCast(patch.pos_in_file));
+        try out_file.writeAll(&std.mem.toBytes(actual_offset));
+        try out_file.seekTo(@intCast(current_pos));
+
+        const start = @as(usize, tensor.data_offsets.start);
+        const end = @as(usize, tensor.data_offsets.end);
+        const tensor_data = safetensors_buffer[start..end];
+        const is_norm = std.mem.endsWith(u8, patch.name, "_norm.weight");
+        const tensor_type = try ParseTensorType(tensor.dtype);
+        const type_size = TypeSize(tensor_type);
+        const count = tensor_data.len / type_size;
+
+        if (is_norm) {
+            // Convert norms to F32
+            var buf = try allocator.alloc(f32, count);
+            defer allocator.free(buf);
+
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                buf[i] = switch (tensor_type) {
+                    .TensorTypeF32 => @as(f32, @bitCast(readU32LE(tensor_data[i * 4 ..][0..4]))),
+                    .TensorTypeF16 => quant.halfToF32(readU16LE(tensor_data[i * 2 ..][0..2])),
+                    .TensorTypeBF16 => bf16ToF32(readU16LE(tensor_data[i * 2 ..][0..2])),
+                    else => return error.UnsupportedDtype,
+                } + 1.0;
+            }
+
+            try writer.writer.writeAll(@as([*]const u8, @ptrCast(buf.ptr))[0 .. count * @sizeOf(f32)]);
+            writer.advance(count * @sizeOf(f32));
+        } else switch (tensor_type) {
+            .TensorTypeBF16 => {
+                // Downcast to F16
+                var buf = try allocator.alloc(u16, count);
+                defer allocator.free(buf);
+                var i: usize = 0;
+                while (i < count) : (i += 1) {
+                    const bf_bits = readU16LE(tensor_data[i * 2 ..][0..2]);
+                    buf[i] = bf16ToF16(bf_bits);
+                }
+                try writer.writer.writeAll(@as([*]const u8, @ptrCast(buf.ptr))[0 .. count * 2]);
+                writer.advance(count * 2);
+            },
+            .TensorTypeF16, .TensorTypeF32 => {
+                // Write raw bytes
+                try writer.writer.writeAll(tensor_data);
+                writer.advance(tensor_data.len);
+            },
+            else => return error.UnsupportedDtype,
+        }
+
+        // pad to alignment
+        try writer.writePadding(alignment);
+    }
+}
+fn bf16ToF16(bf16_bits: u16) u16 {
+    // Simple linear conversion: take top 7 exponent + 8 mantissa bits, or implement proper rounding
+    const f32_val = bf16ToF32(bf16_bits); // convert BF16 -> F32
+    return quant.f32ToHalf(f32_val); // convert F32 -> F16
+}
+// --- Helper functions for little-endian reads ---
+fn readU16LE(bytes: []const u8) u16 {
+    return @as(u16, bytes[0]) | (@as(u16, bytes[1]) << 8);
+}
+
+fn readU32LE(bytes: []const u8) u32 {
+    return @as(u32, bytes[0]) | (@as(u32, bytes[1]) << 8) | (@as(u32, bytes[2]) << 16) | (@as(u32, bytes[3]) << 24);
+}
+
+fn bf16ToF32(bits: u16) f32 {
+    const shifted = @as(u32, bits) << 16;
+    return @as(f32, @bitCast(shifted));
 }
 
 pub fn prepare_tensorsV2(
@@ -127,82 +277,74 @@ pub fn prepare_tensorsV2(
         try out_file.seekTo(@intCast(patch.pos_in_file));
         try out_file.writeAll(&std.mem.toBytes(actual_offset));
         try out_file.seekTo(@intCast(current_pos));
-
+        //603979776
         const start = @as(usize, @intCast(tensor.data_offsets.start));
         const end = @as(usize, @intCast(tensor.data_offsets.end));
         const tensor_data = safetensors_buffer[start..end];
-
+        std.debug.print("Raw data start of {s}: {any}\n", .{ patch.name, safetensors_buffer[start..@min(start + 32, end)] });
         const is_norm = std.mem.endsWith(u8, patch.name, "_norm.weight");
-
-        if (is_norm) {
-            // We need to write F32 values (header says F32 for norms). Convert from original dtype -> F32,
-            // add 1.0 to each element, then write F32 bytes.
-            const src_dtype = tensor.dtype; // original safetensors dtype string, e.g. "F16", "F32", "BF16"
-            if (std.mem.eql(u8, src_dtype, "F32")) {
-                // src is f32: read 4 bytes per element, add 1.0
-                const count = @as(usize, @intCast(tensor_data.len / 4));
-                var buf = try allocator.alloc(f32, count);
-                defer allocator.free(buf);
-
-                var i: usize = 0;
-                while (i < count) : (i += 1) {
+        const tensor_type = try ParseTensorType(tensor.dtype);
+        const type_size = TypeSize(tensor_type);
+        const count = tensor_data.len / type_size;
+        //if (is_norm) {
+        // We need to write F32 values (header says F32 for norms). Convert from original dtype -> F32,
+        // add 1.0 to each element, then write F32 bytes.
+        //const src_dtype = tensor.dtype; // original safetensors dtype string, e.g. "F16", "F32", "BF16"
+        var buf = try allocator.alloc(f32, count);
+        defer allocator.free(buf);
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            switch (tensor_type) {
+                .TensorTypeF32 => {
+                    // src is f32: read 4 bytes per element, add 1.0
                     const b0 = @as(u32, tensor_data[i * 4 + 0]);
                     const b1 = @as(u32, tensor_data[i * 4 + 1]);
                     const b2 = @as(u32, tensor_data[i * 4 + 2]);
                     const b3 = @as(u32, tensor_data[i * 4 + 3]);
                     const bits = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
-                    buf[i] = @as(f32, @bitCast(bits)) + 1.0;
-                }
+                    if (is_norm) {
+                        buf[i] = @as(f32, @bitCast(bits)) + 1.0;
+                    }
+                    buf[i] = @as(f32, @bitCast(bits));
+                    //std.debug.print("buf F32:{any}", .{buf[i]});
 
-                // write buf as bytes
-                const bytes_to_write = @as(usize, @intCast(count * @sizeOf(f32)));
-                try writer.writer.writeAll(@as([*]const u8, @ptrCast(buf.ptr))[0..bytes_to_write]);
-                writer.advance(bytes_to_write);
-            } else if (std.mem.eql(u8, src_dtype, "F16")) {
-                // src is f16: each element is 2 bytes. Convert half -> f32, add 1.0
-                const count = @as(usize, @intCast(tensor_data.len / 2));
-                var buf = try allocator.alloc(f32, count);
-                defer allocator.free(buf);
+                },
+                .TensorTypeF16 => {
+                    // src is f16: each element is 2 bytes. Convert half -> f32, add 1.0
 
-                var i: usize = 0;
-                while (i < count) : (i += 1) {
                     const lo = @as(u16, tensor_data[i * 2 + 0]);
                     const hi = @as(u16, tensor_data[i * 2 + 1]);
                     const halfBits = lo | (@as(u16, hi) << 8);
-                    buf[i] = quant.halfToF32(halfBits) + 1.0;
-                }
+                    if (is_norm) {
+                        buf[i] = quant.halfToF32(halfBits) + 1.0;
+                    }
+                    buf[i] = quant.halfToF32(halfBits);
+                    //std.debug.print("buf F16:{any}", .{buf[i]});
+                },
+                .TensorTypeBF16 => {
 
-                const bytes_to_write = @as(usize, @intCast(count * @sizeOf(f32)));
-                try writer.writer.writeAll(@as([*]const u8, @ptrCast(buf.ptr))[0..bytes_to_write]);
-                writer.advance(bytes_to_write);
-            } else if (std.mem.eql(u8, src_dtype, "BF16")) {
-                // src is bfloat16: 2 bytes per element, top 16 bits of f32.
-                const count = @as(usize, @intCast(tensor_data.len / 2));
-                var buf = try allocator.alloc(f32, count);
-                defer allocator.free(buf);
+                    // bfloat16: 2 bytes, top 16 bits of f32
+                    // Convert to f32 by shifting left 16 bits and adding 1.0
 
-                var i: usize = 0;
-                while (i < count) : (i += 1) {
-                    const lo = @as(u32, tensor_data[i * 2 + 0]);
-                    const hi = @as(u32, tensor_data[i * 2 + 1]);
-                    const halfBits = lo | (hi << 8); // 16-bit bfloat
-                    const bits = halfBits << 16; // to f32 top 16 bits
-                    buf[i] = @as(f32, @bitCast(bits)) + 1.0;
-                }
-
-                const bytes_to_write = @as(usize, @intCast(count * @sizeOf(f32)));
-                try writer.writer.writeAll(@as([*]const u8, @ptrCast(buf.ptr))[0..bytes_to_write]);
-                writer.advance(bytes_to_write);
-            } else {
-                // Unknown dtype - fallback: write raw bytes (but this will likely break offsets)
-                try writer.writer.writeAll(tensor_data);
-                writer.advance(tensor_data.len);
+                    const lo = @as(u32, tensor_data[i * 2 + 0]); // first byte
+                    const hi = @as(u32, tensor_data[i * 2 + 1]); // second byte
+                    const halfBits = lo | (hi << 8); // little-endian word
+                    const bits = halfBits << 16; // shift to top 16 bits of F32
+                    if (is_norm) {
+                        buf[i] = @as(f32, @bitCast(bits)) + 1.0;
+                    }
+                    buf[i] = @as(f32, @bitCast(bits));
+                    //std.debug.print("buf B16:{any}", .{buf[i]});
+                },
+                else => return error.UnsupportedDtype,
             }
-        } else {
-            // Non-norm tensors: write raw bytes as-is (no +1)
-            try writer.writer.writeAll(tensor_data);
-            writer.advance(tensor_data.len);
         }
+
+        try writer.writer.writeAll(@as([*]const u8, @ptrCast(buf.ptr))[0 .. count * @sizeOf(f32)]);
+        writer.advance(count * @sizeOf(f32));
+        //try writer.writer.writeAll(tensor_data);
+        //writer.advance(tensor_data.len);
+        //}
 
         // pad to alignment based on writer.position
         try writer.writePadding(alignment);
@@ -322,7 +464,7 @@ pub fn convertToGGUFFromSafeTensors(
     try writer.writeU32(4); // ggufTypeUint32
     try writer.writeU32(quant_version);
 
-    try prepare_tensorsV2(
+    try prepare_tensorsV3(
         allocator,
         metadata,
         safetensors_buffer,

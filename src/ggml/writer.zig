@@ -139,16 +139,30 @@ pub const GGUFWriter = struct {
             else => return error.UnsupportedArrayType,
         }
     }
-
     pub fn writePadding(self: *Self, alignment: u64) !void {
-        const offset = @as(u64, @intCast(self.position));
+        const offset = self.position;
         const pad = ggufPadding(offset, alignment);
-        if (pad > 0) {
-            const zeroes = [_]u8{0} ** 256;
-            try self.writer.writeAll(zeroes[0..@intCast(pad)]);
-            self.advance(@intCast(pad));
+        if (pad == 0) return;
+
+        var remaining: usize = @as(usize, @intCast(pad));
+        const zeros = [_]u8{0} ** 256;
+
+        while (remaining > 0) : (remaining -= @min(remaining, 256)) {
+            const chunk = @min(remaining, 256);
+            try self.writer.writeAll(zeros[0..chunk]);
+            self.advance(chunk);
         }
     }
+
+    // pub fn writePadding(self: *Self, alignment: u64) !void {
+    //     const offset = @as(u64, @intCast(self.position));
+    //     const pad = ggufPadding(offset, alignment);
+    //     if (pad > 0) {
+    //         const zeroes = [_]u8{0} ** 256;
+    //         try self.writer.writeAll(zeroes[0..@intCast(pad)]);
+    //         self.advance(@intCast(pad));
+    //     }
+    // }
     pub fn writeTokenList(self: *GGUFWriter, tokens: [][]const u8) !void {
         // write array length
         try self.writeU64(@as(u64, @intCast(tokens.len)));

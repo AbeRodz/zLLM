@@ -1,17 +1,17 @@
 // custom parser for handling cases within the openAI standard, cannot use tokamak's dynamic validator.
 const std = @import("std");
-const Content = @import("completions.zig").Content;
-const ContentPart = @import("completions.zig").ContentPart;
-const TextContentPart = @import("completions.zig").TextContentPart;
-const ImageContentPart = @import("completions.zig").ImageContentPart;
-const AudioContentPart = @import("completions.zig").AudioContentPart;
-const FileContentPart = @import("completions.zig").FileContentPart;
-const Message = @import("completions.zig").Message;
-const ResponseFormat = @import("completions.zig").ResponseFormat;
-const JsonSchema = @import("completions.zig").JsonSchema;
-const StreamOptions = @import("completions.zig").StreamOptions;
-const ContentObject = @import("completions.zig").ContentObject;
-const ChatCompletionRequest = @import("completions.zig").ChatCompletionRequest;
+const Content = @import("models/completions.zig").Content;
+const ContentPart = @import("models/completions.zig").ContentPart;
+const TextContentPart = @import("models/completions.zig").TextContentPart;
+const ImageContentPart = @import("models/completions.zig").ImageContentPart;
+const AudioContentPart = @import("models/completions.zig").AudioContentPart;
+const FileContentPart = @import("models/completions.zig").FileContentPart;
+const Message = @import("models/completions.zig").Message;
+const ResponseFormat = @import("models/completions.zig").ResponseFormat;
+const JsonSchema = @import("models/completions.zig").JsonSchema;
+const StreamOptions = @import("models/completions.zig").StreamOptions;
+const ContentObject = @import("models/completions.zig").ContentObject;
+const ChatCompletionRequest = @import("models/completions.zig").ChatCompletionRequest;
 
 pub fn decodeParts(allocator: std.mem.Allocator, value: std.json.Value) ![]ContentPart {
     if (value != .array) return error.ExpectedArray;

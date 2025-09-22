@@ -25,7 +25,7 @@ pub fn getOrLoadModel(
     if (runtime_store.get(model_name)) |cached| {
         return cached;
     }
-    const model = try zllama.loadLlamaModelFromRegistry(model_name);
+    const model = try zllama.loadLlamaModelFromRegistry(model_name, allocator);
     const ctx = try zllama.llama_context(model, n_ctx);
     const entry = LoadedModel{ .model = model, .ctx = ctx };
 
