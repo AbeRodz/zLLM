@@ -2,14 +2,18 @@ const std = @import("std");
 const gguf = @import("gguf_converter.zig");
 const registry = @import("../registry/model_registry.zig");
 const registryRuntime = @import("../registry/runtime.zig");
+const sampling = @import("llama_sampler.zig");
 const RingBuffer = @import("../utils/ring_buffer.zig").RingBuffer;
 pub const llama = @cImport({
     @cInclude("llama.h");
 });
+const client = @import("../client/client.zig");
+const converter = @import("../safetensors/gguf/convert.zig");
+const common = @import("llama_common.zig");
 
 var message_ring = RingBuffer(llama.struct_llama_chat_message, 32).init();
 
-pub fn loadLlamaModelFromRegistry(model_name: []const u8) !*llama.struct_llama_model {
+pub fn loadLlamaModelFromRegistry(model_name: []const u8, allocator: std.mem.Allocator) !*llama.struct_llama_model {
     const modelInfo = try registry.findModelErrorless(model_name) orelse return error.UnknownModel;
 
     var gguf_path: ?[]const u8 = null;
@@ -19,13 +23,30 @@ pub fn loadLlamaModelFromRegistry(model_name: []const u8) !*llama.struct_llama_m
             break;
         }
     }
-
     if (gguf_path == null) {
         gguf_path = try modelInfo.localFilePath(modelInfo.name, "model.gguf");
     }
+    const exists = try modelInfo.isCached();
+    if (exists == false) {
+        std.debug.print("Model not cached locally, downloading: {s}\n", .{model_name});
+        client.downloader(modelInfo, allocator) catch |err| {
+            std.debug.print("Error downloading model: {}\n", .{err});
+            return err;
+        };
+
+        std.debug.print("Converting... \n", .{});
+        try converter.convert(model_name, gguf_path.?, allocator);
+    } else {
+        std.debug.print("gguf_path{s}\n", .{gguf_path.?});
+        const gguf_exists = try modelInfo.isGGUFCached();
+        if (gguf_exists == false) {
+            std.debug.print("Model found but gguf not cached, converting: {s}\n", .{model_name});
+            try converter.convert(model_name, gguf_path.?, allocator);
+        }
+        std.debug.print("Model found in cache: {s}\n", .{model_name});
+    }
 
     std.debug.print("loading gguf model: {s}\n", .{gguf_path.?});
-
     llama.llama_backend_init();
 
     var params = llama.llama_model_default_params();
@@ -135,7 +156,7 @@ pub fn execute(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocator)
     const stdout = std.io.getStdOut().writer();
     const stdin = std.io.getStdIn().reader();
 
-    const model = try loadLlamaModelFromRegistry(model_name);
+    const model = try loadLlamaModelFromRegistry(model_name, allocator);
     defer llama.llama_free_model(model);
 
     const ctx = try llama_context(model, n_ctx);
@@ -195,16 +216,59 @@ pub fn execute(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocator)
 }
 pub const StreamIter = struct {
     ctx: *llama.struct_llama_context,
+    //sampler: *sampling.CommonSampler,
     sampler: [*c]llama.struct_llama_sampler,
     model: *llama.struct_llama_model,
     allocator: std.mem.Allocator,
     vocab: *const llama.struct_llama_vocab,
+    // token_cache: std.ArrayList(usize) = std.ArrayList(usize).init(std.heap.page_allocator),
     batch: llama.llama_batch,
+    buf: [512]u8 = undefined,
+    token_buf: [1]llama.llama_token = undefined,
     is_done: bool = false,
     prompt_token_count: i32,
     completion_token_count: i32 = 0,
 
-    pub fn next(self: *StreamIter) !?[]const u8 {
+    pub inline fn next(self: *StreamIter) !?[]const u8 {
+        if (self.is_done) return error.EndOfStream;
+
+        const n_ctx_used = llama.llama_kv_self_used_cells(self.ctx);
+        if (n_ctx_used + self.batch.n_tokens > llama.llama_n_ctx(self.ctx)) {
+            self.is_done = true;
+            return error.EndOfStream;
+        }
+
+        if (llama.llama_decode(self.ctx, self.batch) != 0) {
+            self.is_done = true;
+            return error.EndOfStream;
+        }
+
+        const token = llama.llama_sampler_sample(self.sampler, self.ctx, -1);
+        if (llama.llama_vocab_is_eog(self.vocab, token)) {
+            self.is_done = true;
+            return error.EndOfStream;
+        }
+        //var buf: [256]u8 = undefined;
+        const len = llama.llama_token_to_piece(self.vocab, token, &self.buf, self.buf.len, 0, true);
+        const lenCast = @as(usize, @intCast(len));
+        if (len < 0 or lenCast > self.buf.len) {
+            self.is_done = true;
+            return error.InvalidTokenLength;
+            //return null;
+        }
+        const slice = self.buf[0..lenCast];
+
+        self.token_buf[0] = token;
+        const tok = @as([*c]llama.llama_token, &self.token_buf);
+        self.batch.token = tok;
+        self.batch.n_tokens = 1;
+        //const batch = llama.llama_batch_get_one(tok, 1);
+        //self.batch = batch;
+
+        self.completion_token_count += 1;
+        return slice;
+    }
+    pub fn nextBatchedCommon(self: *StreamIter) !?[]const u8 {
         if (self.is_done) return null;
 
         const n_ctx_used = llama.llama_kv_self_used_cells(self.ctx);
@@ -212,86 +276,89 @@ pub const StreamIter = struct {
             self.is_done = true;
             return null;
         }
-
-        if (llama.llama_decode(self.ctx, self.batch) != 0) {
-            self.is_done = true;
-            return null;
-        }
-
-        const token = llama.llama_sampler_sample(self.sampler, self.ctx, -1);
-        if (llama.llama_vocab_is_eog(self.vocab, token)) {
-            self.is_done = true;
-            return null;
-        }
-        var buf: [4096]u8 = undefined;
-        const len = llama.llama_token_to_piece(self.vocab, token, &buf, buf.len, 0, true);
-        if (len < 0 or @as(usize, @intCast(len)) > buf.len) {
-            std.debug.print("Invalid len = {}\n", .{len});
-            self.is_done = true;
-            return null;
-        }
-        const slice = buf[0..@as(usize, @intCast(len))];
-        // const slice = self.allocator.dupe(u8, buf[0..@as(usize, @intCast(len))]) catch {
+        // if (llama.llama_decode(self.ctx, self.batch) != 0) {
         //     self.is_done = true;
         //     return null;
-        // };
-        //const prompt_tokens = try allocator.alloc(i32, @as(usize, @intCast(n_prompt)));
-        const tokens = try std.heap.page_allocator.alloc(i32, 1);
-        tokens[0] = token;
-        const tok = @as([*c]i32, @ptrCast(tokens.ptr));
-        const batch = llama.llama_batch_get_one(tok, 1);
-        self.batch = batch;
-        //defer std.heap.page_allocator.free(tokens);
-        self.completion_token_count += 1;
-        return slice;
+        // }
+        // Batch size for multiple tokens at once
+        const batch_size = 8;
+        var token_buf: [256]u8 = undefined; // max token piece length buffer
+        var tokens: [batch_size]llama.llama_token = undefined; // tokens buffer
+
+        var output = std.ArrayList(u8).init(std.heap.page_allocator);
+
+        // Clear batch before adding tokens
+        //common.common_batch_clear(&self.batch);
+
+        for (0..batch_size) |i| {
+            //const token = llama.llama_sampler_sample(self.sampler, self.ctx, -1);
+            const token = sampling.common_sampler_sample(self.sampler, self.ctx, -1, true);
+            sampling.common_sampler_accept(self.sampler, token, true);
+            // Stop if end-of-generation token
+            if (llama.llama_vocab_is_eog(self.vocab, token)) {
+                self.is_done = true;
+                break;
+            }
+
+            tokens[i] = token;
+
+            // Add token to batch with common_batch_add
+            // Arguments: (batch, tokens ptr, token count, seq_id, logits_pos, is_embd)
+            // Using seq_id = i for example (distinct per token in batch)
+            // logits_pos = 0 (starting logit position for this token)
+            common.common_batch_add(
+                &self.batch,
+                token,
+                @as(llama.llama_pos, @intCast(n_ctx_used)),
+                &[_]i32{0}, // sequence id (unique per token)
+                true, // logits offset
+            );
+        }
+
+        if (self.batch.n_tokens == 0) {
+            // no tokens added - end of generation
+            output.deinit();
+            return null;
+        }
+
+        // Run decoding on the batch of tokens
+        if (llama.llama_decode(self.ctx, self.batch) != 0) {
+            self.is_done = true;
+            output.deinit();
+            return null;
+        }
+
+        // For each token, convert to piece and append to output buffer
+        for (0..@as(usize, @intCast(self.batch.n_tokens))) |i| {
+            const len = llama.llama_token_to_piece(self.vocab, tokens[i], &token_buf, token_buf.len, 0, true);
+            if (len < 0 or @as(usize, @intCast(len)) > token_buf.len) {
+                std.debug.print("Invalid token piece length: {}\n", .{len});
+                self.is_done = true;
+                output.deinit();
+                return null;
+            }
+
+            try output.appendSlice(token_buf[0..@as(usize, @intCast(len))]);
+        }
+
+        const result = try output.toOwnedSlice();
+        output.deinit();
+
+        return result;
     }
 
     pub fn deinit(_: *StreamIter) void {
         // No dynamic memory in struct currently might need in the future?
     }
 };
-
-fn generateStream(
-    ctx: *llama.struct_llama_context,
-    smpl: [*c]llama.struct_llama_sampler,
-    model: *llama.struct_llama_model,
-    allocator: std.mem.Allocator,
-    prompt: []const u8,
-    on_token: fn ([]const u8) anyerror!void,
-) !void {
-    const vocab = llama.llama_model_get_vocab(model);
-    const is_first = llama.llama_kv_self_used_cells(ctx) == 0;
-    const n_prompt = -llama.llama_tokenize(vocab, prompt.ptr, @as(i32, @intCast(prompt.len)), null, 0, is_first, true);
-
-    const prompt_tokens = try allocator.alloc(i32, @as(usize, @intCast(n_prompt)));
-    defer allocator.free(prompt_tokens);
-
-    if (llama.llama_tokenize(vocab, prompt.ptr, @as(i32, @intCast(prompt.len)), prompt_tokens.ptr, @as(i32, @intCast(prompt.len)), is_first, true) < 0) {
-        return error.TokenizationFailed;
+fn createSeqIds(allocator: std.mem.Allocator, n_parallel: usize) ![]i32 {
+    const seq_ids = try allocator.alloc(i32, n_parallel);
+    for (seq_ids, 0..) |*id, i| {
+        id.* = @as(i32, @intCast(i));
     }
-
-    var batch = llama.llama_batch_get_one(prompt_tokens.ptr, n_prompt);
-    var new_token_id: llama.llama_token = undefined;
-
-    while (true) {
-        const n_ctx_used = llama.llama_kv_self_used_cells(ctx);
-        if (n_ctx_used + batch.n_tokens > llama.llama_n_ctx(ctx)) break;
-
-        if (llama.llama_decode(ctx, batch) != 0) return error.DecodeFailed;
-
-        new_token_id = llama.llama_sampler_sample(smpl, ctx, -1);
-        if (llama.llama_vocab_is_eog(vocab, new_token_id)) break;
-
-        var buf: [4096]u8 = undefined;
-        const len = llama.llama_token_to_piece(vocab, new_token_id, &buf, buf.len, 0, true);
-        if (len < 0) return error.TokenToPieceFailed;
-
-        const slice = buf[0..@as(usize, @intCast(len))];
-        try on_token(slice);
-
-        batch = llama.llama_batch_get_one(&new_token_id, 1);
-    }
+    return seq_ids;
 }
+
 pub fn respondToPromptStream(
     allocator: std.mem.Allocator,
     model_name: []const u8,
@@ -301,7 +368,10 @@ pub fn respondToPromptStream(
     const loaded = try registryRuntime.getOrLoadModel(allocator, model_name, n_ctx);
     const tmpl = llama.llama_model_chat_template(loaded.model, null);
     const sampler = llama_sampler();
-
+    // const params = common.CommonParams{
+    //     .sampling = .{ .temp = 0.2 },
+    // };
+    //const sampler = try sampling.CommonSampler.init(allocator, loaded.model, params.sampling);
     const bytes_per_token = 4;
     const headroom = 20;
     const buffer_size = calculateBufferSize(n_ctx, bytes_per_token, headroom);
@@ -322,11 +392,14 @@ pub fn respondToPromptStream(
     if (llama.llama_tokenize(vocab, chat_prompt.ptr, @as(i32, @intCast(chat_prompt.len)), prompt_tokens.ptr, @as(i32, @intCast(chat_prompt.len)), is_first, true) < 0) {
         return error.TokenizationFailed;
     }
-
+    //const batch = llama.llama_batch_init(n_prompt, 0, 1);
+    const cpu = try std.Thread.getCpuCount();
+    const batches = @as(i32, @intCast(@divFloor(cpu, 4)));
     const batch = llama.llama_batch_get_one(prompt_tokens.ptr, n_prompt);
-
+    llama.llama_set_n_threads(loaded.ctx, @as(i32, @intCast(cpu)), batches);
     return StreamIter{
         .ctx = loaded.ctx,
+        //.sampler = sampler,
         .sampler = sampler,
         .model = loaded.model,
         .allocator = allocator,

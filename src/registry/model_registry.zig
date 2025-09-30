@@ -36,6 +36,52 @@ pub const ModelInfo = struct {
         }
         return true;
     }
+    pub fn isGGUFCached(self: Self) !bool {
+        const path = self.localFilePath(self.name, "model.gguf") catch return false;
+        std.fs.cwd().access(path, .{}) catch return false;
+        return true;
+    }
+    pub fn loadGGUFModelBuffer(self: ModelInfo, allocator: std.mem.Allocator) ![]u8 {
+        if (self.files.len == 0) return error.UnknownModel;
+        const path = try self.localFilePath(self.name, "model.gguf");
+        const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+        defer file.close();
+
+        const file_size = try file.getEndPos();
+        const buffer = try allocator.alloc(u8, file_size);
+
+        _ = try file.readAll(buffer);
+
+        return buffer;
+    }
+
+    pub fn loadSafetensorsBuffer(self: ModelInfo, allocator: std.mem.Allocator) ![]u8 {
+        if (self.files.len == 0) return error.UnknownModel;
+
+        const path = try self.localFilePath(self.name, "model.safetensors");
+        const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+        defer file.close();
+
+        const file_size = try file.getEndPos();
+        const buffer = try allocator.alloc(u8, file_size);
+        _ = try file.readAll(buffer);
+
+        return buffer;
+    }
+    // TODO
+    pub fn SeekSafetensorsBuffer(self: ModelInfo, allocator: std.mem.Allocator) ![]u8 {
+        if (self.files.len == 0) return error.UnknownModel;
+
+        const path = try self.localFilePath(self.name, "model.safetensors");
+        const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+        defer file.close();
+
+        const file_size = try file.getEndPos();
+        const buffer = try allocator.alloc(u8, file_size);
+        _ = try file.readAll(buffer);
+
+        return buffer;
+    }
 };
 
 pub fn getCacheDir(allocator: std.mem.Allocator) ![]u8 {

@@ -9,16 +9,7 @@
       ]
     },
     {
-      "name": "vit-base",
-      "base_uri": "https://huggingface.co/google/vit-base-patch16-224/resolve/main/",
-      "files": [
-        "model.safetensors",
-        "config.json",
-        "preprocessor_config.json"
-      ]
-    },
-    {
-        "name":"gemma-3-1b",
+        "name":"gemma3",
         "base_uri": "https://huggingface.co/google/gemma-3-1b-it/resolve/main/",
         "files":[
             "tokenizer.json",
@@ -28,6 +19,18 @@
             "special_tokens_map.json",
             "generation_config.json",
             "added_tokens.json",
+            "model.safetensors"
+        ]
+    },
+        {
+        "name":"smollm2-360",
+        "base_uri": "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/",
+        "files":[
+            "tokenizer.json",
+            "config.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "generation_config.json",
             "model.safetensors"
         ]
     }

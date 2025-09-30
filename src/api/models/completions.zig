@@ -142,7 +142,7 @@ pub const ChatCompletionResponse = struct {
 
 pub const ChatCompletionChunk = struct {
     id: []const u8,
-    choices: []ChunkChoice,
+    choices: [1]ChunkChoice,
     created: i64,
     model: []const u8,
     system_fingerprint: []const u8,
