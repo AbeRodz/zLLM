@@ -4,7 +4,7 @@ const std = @import("std");
 pub const llama = @cImport({
     @cInclude("llama.h");
 });
-
+const llama_model = @import("../llama/cTypes.zig").LlamaModel;
 pub const LoadedModel = struct {
     model: *llama.struct_llama_model,
     ctx: *llama.struct_llama_context,
@@ -27,7 +27,7 @@ pub fn getOrLoadModel(
     }
     const model = try zllama.loadLlamaModelFromRegistry(model_name, allocator);
     const ctx = try zllama.llama_context(model, n_ctx);
-    const entry = LoadedModel{ .model = model, .ctx = ctx };
+    const entry = LoadedModel{ .model = @ptrCast(model), .ctx = @ptrCast(ctx) };
 
     try runtime_store.put(try allocator.dupe(u8, model_name), entry);
     return entry;

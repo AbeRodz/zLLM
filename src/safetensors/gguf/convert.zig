@@ -67,8 +67,8 @@ pub fn prepare_tensorsV3(
         tensor_info: *const TensorInfo,
         name: []const u8,
     };
-    var offset_patch_list = std.ArrayList(OffsetPatch).init(allocator);
-    defer offset_patch_list.deinit();
+    var offset_patch_list: std.ArrayList(OffsetPatch) = .empty;
+    defer offset_patch_list.deinit(allocator);
 
     // 1) Write tensor headers
     for (offkeys, 0..) |entry, index| {
@@ -103,7 +103,7 @@ pub fn prepare_tensorsV3(
         const offset_placeholder_pos = writer.position;
         try writer.writeU64(0);
 
-        try offset_patch_list.append(.{
+        try offset_patch_list.append(allocator, .{
             .tensor_index = index,
             .pos_in_file = offset_placeholder_pos,
             .tensor_info = tensor,
@@ -218,8 +218,8 @@ pub fn prepare_tensorsV2(
         tensor_info: *const TensorInfo,
         name: []const u8,
     };
-    var offset_patch_list = std.ArrayList(OffsetPatch).init(allocator);
-    defer offset_patch_list.deinit();
+    var offset_patch_list: std.ArrayList(OffsetPatch) = .empty;
+    defer offset_patch_list.deinit(allocator);
 
     // 1) Write tensor headers (swap dims for .weight but not _norm.weight), write dtype header (F16 default, F32 for norm)
     for (offkeys, 0..) |entry, index| {
@@ -255,7 +255,7 @@ pub fn prepare_tensorsV2(
         const offset_placeholder_pos = writer.position;
         try writer.writeU64(0);
 
-        try offset_patch_list.append(.{
+        try offset_patch_list.append(allocator, .{
             .tensor_index = index,
             .pos_in_file = offset_placeholder_pos,
             .tensor_info = tensor,
@@ -433,7 +433,7 @@ pub fn convertToGGUFFromSafeTensors(
     allocator: std.mem.Allocator,
     metadata: *Metadata,
     safetensors_buffer: []const u8,
-    file_writer: std.io.AnyWriter,
+    file_writer: std.io.Writer,
     basename: []const u8,
     architecture: []const u8,
     model_name: []const u8,
@@ -649,7 +649,7 @@ pub fn convert(model_name: []const u8, output_path: []const u8, allocator: std.m
     var output_file = try fs.cwd().createFile(output_path, .{ .read = false, .truncate = true });
     defer output_file.close();
 
-    const writer = output_file.writer().any();
+    const writer = output_file.writer(buffer).interface;
     // Convert to GGUF and write to file
     const tokenizer_path = try found_model.localFilePath(found_model.name, "tokenizer_export.json");
     try convertToGGUFFromSafeTensors(
