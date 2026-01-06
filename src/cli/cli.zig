@@ -77,7 +77,10 @@ fn convert(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
 fn run(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     const model_name = args.next() orelse return error.InvalidUsage;
     const n_ctx = 8192;
-    try llama.execute(model_name, n_ctx, allocator);
+    llama.execute(model_name, n_ctx, allocator) catch |err| {
+        std.debug.print("Error during execution: {}\n", .{err});
+        return err;
+    };
 }
 
 fn serve(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
@@ -142,14 +145,16 @@ fn printUsage() void {
         \\  zig build run -- <command> <model-name> [threads]
         \\
         \\Commands:
-        \\  get        Downloads a model from HuggingFace
-        \\  convert    Converts a downloaded model to GGUF
-        \\  serve      Serves http server 
-        \\  help       Show this message
+        \\  get                 Downloads a model from HuggingFace
+        \\  convert             Converts a downloaded model to GGUF
+        \\  read                Reads, displays and validates a GGUF model info
+        \\  read-safetensors    Reads, displays and validates a Safetensors model info
+        \\  serve               Serves http server 
+        \\  help                Show this message
         \\
         \\Examples:
-        \\  zig build run -- get vit-base 8
-        \\  zig build run -- convert vit-base
+        \\  zig build run -- get gemma3
+        \\  zig build run -- convert gemma3
         \\  zig build run -- serve
         \\
     , .{});

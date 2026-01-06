@@ -16,11 +16,15 @@ pub const MetalContext = struct {
     // }
 
     pub fn metalLibrary(ctx: *BuildContext, common: *Step.InstallFile) MetalContext {
-        const metal_lib = ctx.build.addStaticLibrary(.{
-            .name = "ggml-metal",
+        const metal_lib = ctx.build.addLibrary(.{ .name = "ggml-metal", .root_module = ctx.build.createModule(.{
             .target = ctx.target,
             .optimize = ctx.optimize,
-        });
+        }) });
+        // const metal_lib = ctx.build.addStaticLibrary(.{
+        //     .name = "ggml-metal",
+        //     .target = ctx.target,
+        //     .optimize = ctx.optimize,
+        // });
 
         Csources.addMetalIncludes(ctx, metal_lib);
         Csources.addMetalFrameworks(metal_lib);

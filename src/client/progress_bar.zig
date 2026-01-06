@@ -53,16 +53,17 @@ pub fn runProgressBar(ctx: *DownloadContext, total: usize, start_ns: i128) void 
         );
 
         if (downloaded >= total) break;
-        std.time.sleep(100 * std.time.ns_per_ms);
+        std.Thread.sleep(100 * std.time.ns_per_ms);
     }
 
     std.debug.print("\n", .{});
 }
 
 fn repeatChar(char_str: []const u8, count: usize) []const u8 {
-    var list = std.ArrayList(u8).init(std.heap.page_allocator);
+    const allocator = std.heap.page_allocator;
+    var list: std.ArrayList(u8) = .empty;
     for (0..count) |_| {
-        _ = list.appendSlice(char_str) catch {};
+        _ = list.appendSlice(allocator, char_str) catch {};
     }
-    return list.toOwnedSlice() catch " ";
+    return list.toOwnedSlice(allocator) catch " ";
 }
