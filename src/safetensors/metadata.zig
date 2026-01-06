@@ -16,11 +16,11 @@ pub const Metadata = struct {
         tensor_entries: []TensorEntry,
     ) !Metadata {
         var index_map = std.StringHashMap(usize).init(allocator);
-        var tensors = std.ArrayList(TensorInfo).init(allocator);
+        var tensors: std.ArrayList(TensorInfo) = .empty;
 
         for (0.., tensor_entries) |i, entry| {
             try index_map.put(entry.name, i);
-            try tensors.append(entry.info);
+            try tensors.append(allocator, entry.info);
         }
 
         const metadata = Metadata{
