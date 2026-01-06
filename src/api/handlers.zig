@@ -36,16 +36,16 @@ pub fn handleCompletion(ctx: tk.Context, allocator: std.mem.Allocator) !ChatComp
     const req = try parser.decodeCompletionRequest(allocator, body);
 
     var model_response: []u8 = undefined;
-    var prompt = std.ArrayList(u8).init(allocator);
-    defer prompt.deinit();
+    var prompt: std.ArrayList(u8) = .empty;
+    defer prompt.deinit(allocator);
 
     for (req.messages) |msg| {
         const content = parser.getTextContent(msg).?;
 
         const prefix = msg.role;
-        try prompt.appendSlice(prefix);
-        try prompt.appendSlice(content);
-        try prompt.appendSlice("\n");
+        try prompt.appendSlice(allocator, prefix);
+        try prompt.appendSlice(allocator, content);
+        try prompt.appendSlice(allocator, "\n");
     }
 
     model_response = try llama.respondToPrompt(allocator, req.model, 8192, prompt.items);
@@ -81,16 +81,16 @@ pub fn handleCompletionStream(ctx: *tk.Context, allocator: std.mem.Allocator) !v
     const body = ctx.req.body().?;
     const req = try parser.decodeCompletionRequest(allocator, body);
 
-    var prompt = std.ArrayList(u8).init(allocator);
-    defer prompt.deinit();
+    var prompt: std.ArrayList(u8) = .empty;
+    defer prompt.deinit(allocator);
 
     for (req.messages) |msg| {
         const content = parser.getTextContent(msg);
         if (content) |val| {
             const prefix = msg.role;
-            try prompt.appendSlice(prefix);
-            try prompt.appendSlice(val);
-            try prompt.appendSlice("\n");
+            try prompt.appendSlice(allocator, prefix);
+            try prompt.appendSlice(allocator, val);
+            try prompt.appendSlice(allocator, "\n");
         }
     }
 

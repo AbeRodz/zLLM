@@ -15,17 +15,17 @@ pub fn resolveRedirects(ctx: *DownloadContext, start_url: []const u8) !RedirectR
 
     const uri = try std.Uri.parse(start_url);
 
-    var buf: [4096]u8 = undefined;
+    //var buf: [4096]u8 = undefined;
     const headers = try utils.buildHeaders(ctx, ctx.allocator, &[_]http.Header{});
     defer ctx.allocator.free(headers);
     var client = http.Client{ .allocator = ctx.allocator };
     defer client.deinit();
-    var req = try utils.do(&client, uri, .HEAD, headers, &buf);
+    var req = try utils.do(&client, uri, .HEAD, headers);
     defer req.deinit();
 
-    const res = req.response;
+    const res = try req.receiveHead(&.{});
 
-    if (res.status == .unauthorized) {
+    if (res.head.status == .unauthorized) {
         if (ctx.auth_token == null) {
             std.debug.print("repository requires bearer token, please add HF_TOKEN env variable and try again.", .{});
             return error.RequiredBearerToken;
@@ -35,31 +35,31 @@ pub fn resolveRedirects(ctx: *DownloadContext, start_url: []const u8) !RedirectR
 
         // Retry the request with auth
 
-        var req_retry = try utils.do(&client, uri, .HEAD, headers, &buf);
+        var req_retry = try utils.do(&client, uri, .HEAD, headers);
 
         defer req_retry.deinit();
 
-        const res_retry = req_retry.response;
+        const res_retry = try req_retry.receiveHead(&.{});
 
-        if (res_retry.status == .found or res_retry.status == .moved_permanently) {
-            if (res_retry.location) |new_url| {
+        if (res_retry.head.status == .found or res_retry.head.status == .moved_permanently) {
+            if (res_retry.head.location) |new_url| {
                 url = std.fmt.bufPrint(&url_buffer, "{s}", .{new_url}) catch return error.UrlTooLong;
                 required_auth = true;
             } else {
                 return error.MissingRedirectLocation;
             }
         } else {
-            std.debug.print("Failed after retry with HTTP status: {}\n", .{res_retry.status});
+            std.debug.print("Failed after retry with HTTP status: {}\n", .{res_retry.head.status});
             return error.HttpError;
         }
-    } else if (res.status == .found or res.status == .moved_permanently) {
-        if (res.location) |new_url| {
+    } else if (res.head.status == .found or res.head.status == .moved_permanently) {
+        if (res.head.location) |new_url| {
             url = std.fmt.bufPrint(&url_buffer, "{s}", .{new_url}) catch return error.UrlTooLong;
         } else {
             return error.MissingRedirectLocation;
         }
     } else {
-        std.debug.print("Failed with HTTP status: {}\n", .{res.status});
+        std.debug.print("Failed with HTTP status: {}\n", .{res.head.status});
         return error.HttpError;
     }
     return RedirectResult{ .url = try std.fmt.allocPrint(ctx.allocator, "{s}", .{url}), .required_auth = required_auth };

@@ -841,8 +841,9 @@ pub const TensorNameMap = struct {
         try_suffixes: []const []const u8,
     ) !?MappingEntry {
         // 1. Exact match
-        const stdout = std.io.getStdOut().writer();
-
+        var stdout_buffer: [1024]u8 = undefined;
+        var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+        const stdout = &stdout_writer.interface;
         if (self.mappings.get(key)) |entry| {
             stdout.print("Exact match hit: {s}\n", .{key}) catch {};
             return MappingEntry{ .name = entry.name, .tensor = entry.tensor };
@@ -885,11 +886,13 @@ pub const TensorNameMap = struct {
                 }
             }
         }
-
+        try stdout.flush();
         return null;
     }
     pub fn printMappings(self: *const TensorNameMap) void {
-        const stdout = std.io.getStdOut().writer();
+        var stdout_buffer: [1024]u8 = undefined;
+        var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+        const stdout = &stdout_writer.interface;
 
         stdout.print("=== Global Mappings ===\n", .{}) catch {};
         var map_iter = self.mappings.iterator();
@@ -901,6 +904,7 @@ pub const TensorNameMap = struct {
             //     stdout.print("value:{s}\n", .{val}) catch {};
             // }
         }
+        try stdout.flush();
     }
     pub fn get_name(self: *Self, allocator: std.mem.Allocator, key: []const u8, try_suffixes: []const []const u8) !?[]const u8 {
         const result = try self.get_type_and_name(allocator, key, try_suffixes) orelse return null;

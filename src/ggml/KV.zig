@@ -145,13 +145,13 @@ pub const KVMap = struct {
             const arch = self.architecture();
             const allocator = std.heap.page_allocator;
 
-            var buffer = std.ArrayList(u8).init(allocator);
-            defer buffer.deinit();
+            var buffer: std.ArrayList(u8) = .empty;
+            defer buffer.deinit(allocator);
 
-            _ = buffer.appendSlice(arch) catch return default_value;
-            _ = buffer.appendSlice(".") catch return default_value;
-            _ = buffer.appendSlice(key) catch return default_value;
-            final_key = buffer.toOwnedSlice() catch return default_value;
+            _ = buffer.appendSlice(allocator, arch) catch return default_value;
+            _ = buffer.appendSlice(allocator, ".") catch return default_value;
+            _ = buffer.appendSlice(allocator, key) catch return default_value;
+            final_key = buffer.toOwnedSlice(allocator) catch return default_value;
         }
 
         if (self.KV.get(final_key)) |val| {

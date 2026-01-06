@@ -37,12 +37,12 @@
     // internet connectivity.
     .dependencies = .{
         .tokamak = .{
-            .url = "git+https://github.com/cztomsik/tokamak.git#9893a5999d1bac92ea23e00ca6985f04ecd4a686",
-            .hash = "tokamak-2.0.0-FbnSeRbzAQC1AZX6qoGoOURfl9PUhAmvj1leTK_0BcTz",
+            .url = "git+https://github.com/cztomsik/tokamak?ref=main#493bb6573a5134d383e7e141521bc4704db523c6",
+            .hash = "tokamak-2.0.0-FbnSeVymBgAOkJiuxPFCjvAcveoNtUEXfp_w3-R-0PyV",
         },
         .uuid = .{
-            .url = "https://github.com/r4gus/uuid-zig/archive/refs/tags/0.3.0.tar.gz",
-            .hash = "uuid-0.3.0-oOieIVZ4AAB_apOo9zFV0a85GYAST-trqzRJMeEfYuQu",
+            .url = "https://github.com/r4gus/uuid-zig/archive/refs/tags/0.4.0.tar.gz",
+            .hash = "uuid-0.4.0-oOieIR2AAAChAUVBY4ABjYI1XN0EbVALmiN0JIlggC3i",
         },
     },
     .paths = .{

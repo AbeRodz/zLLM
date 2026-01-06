@@ -55,7 +55,7 @@ pub fn parseTokenizerJson(allocator: std.mem.Allocator, path: []const u8) !Token
 
     const special_tokens_obj = root_obj.get("special_tokens");
 
-    var tokens = std.ArrayList(TokenEntry).init(allocator);
+    var tokens: std.ArrayList(TokenEntry) = .empty;
     var special_tokens = std.StringArrayHashMap(usize).init(allocator);
 
     // Parse "tokens"
@@ -75,7 +75,7 @@ pub fn parseTokenizerJson(allocator: std.mem.Allocator, path: []const u8) !Token
         const is_unused = token_obj.get("is_unused") orelse continue;
         const is_byte = token_obj.get("is_byte") orelse continue;
 
-        try tokens.append(TokenEntry{
+        try tokens.append(allocator, TokenEntry{
             .piece = piece.string,
             .score = @as(f32, @floatCast(score.float)),
             .type = @as(u32, @intCast(token_type.integer)),
@@ -124,7 +124,7 @@ pub fn parseTokenizerJson(allocator: std.mem.Allocator, path: []const u8) !Token
     }
 
     return TokenizerData{
-        .tokens = try tokens.toOwnedSlice(),
+        .tokens = try tokens.toOwnedSlice(allocator),
         .special_tokens = special_tokens,
         .add_special_tokens = add_special_tokens,
         .chat_template = chat_template,
@@ -156,7 +156,7 @@ pub fn parseTokenizerJsonV2(allocator: std.mem.Allocator, path: []const u8) !Tok
     const special_tokens_obj = root_obj.get("special_tokens");
 
     // --- Collect tokens with their IDs ---
-    var token_list = std.ArrayList(TokenArray).init(allocator);
+    var token_list: std.ArrayList(TokenArray) = .empty;
 
     var iter = tokens_obj.object.iterator();
     while (iter.next()) |entry| {
@@ -197,7 +197,7 @@ pub fn parseTokenizerJsonV2(allocator: std.mem.Allocator, path: []const u8) !Tok
         if (is_byte.bool) {
             tok_type = SentencePieceTokenType.BYTE;
         }
-        try token_list.append(.{
+        try token_list.append(allocator, .{
             .id = id,
             .entry = TokenEntry{
                 .piece = piece.string,
@@ -224,7 +224,7 @@ pub fn parseTokenizerJsonV2(allocator: std.mem.Allocator, path: []const u8) !Tok
     for (token_list.items, 0..) |item, i| {
         tokens[i] = item.entry;
     }
-    token_list.deinit();
+    token_list.deinit(allocator);
 
     // --- Parse special_tokens ---
     var special_tokens = std.StringArrayHashMap(usize).init(allocator);

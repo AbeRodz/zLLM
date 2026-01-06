@@ -12,24 +12,31 @@ pub fn ensureParentDirExists(file_path: []const u8) !void {
     };
 }
 
-pub fn do(client: *http.Client, uri: std.Uri, method: http.Method, headers: []http.Header, buf: []u8) !http.Client.Request {
-    var req = try client.open(method, uri, .{
-        .server_header_buffer = buf,
+pub fn do(client: *http.Client, uri: std.Uri, method: http.Method, headers: []http.Header) !http.Client.Request {
+    var req = try client.request(method, uri, .{
+        //.headers = headers,
         .extra_headers = headers,
+        //.server_header_buffer = buf,
+        //.extra_headers = headers,
     });
-    try req.send();
-    try req.wait();
+    try req.sendBodiless();
+    //try req.send();
+    //try req.wait();
     return req;
 }
 
 pub fn buildHeaders(ctx: *DownloadContext, allocator: std.mem.Allocator, extra: []const http.Header) ![]http.Header {
-    var headers = std.ArrayList(http.Header).init(allocator);
-    for (extra) |h| try headers.append(h);
+    var capacity = extra.len;
+    if (ctx.auth_token != null) {
+        capacity += 1;
+    }
+    var headers = try std.ArrayList(http.Header).initCapacity(allocator, extra.len + capacity);
+    for (extra) |h| try headers.append(allocator, h);
     if (ctx.auth_token) |token| {
         const bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
-        try headers.append(.{ .name = "Authorization", .value = bearer });
+        try headers.append(allocator, .{ .name = "Authorization", .value = bearer });
     }
-    return headers.toOwnedSlice();
+    return headers.toOwnedSlice(allocator);
 }
 pub fn buildHeadersV2(ctx: *DownloadContext, extra: []const http.Header, allocator: std.mem.Allocator) ![]http.Header {
     // Assume max 16 headers

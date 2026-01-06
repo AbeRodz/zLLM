@@ -4,27 +4,27 @@ const Tensor = @import("tensor.zig").Tensor;
 pub const Layer = std.StringHashMapUnmanaged(*const Tensor);
 pub const Tensors = struct {
     items: std.ArrayList(Tensor),
-    pub fn init(allocator: std.mem.Allocator) Tensors {
+    pub fn init() Tensors {
         return Tensors{
-            .items = std.ArrayList(Tensor).init(allocator),
+            .items = .empty,
         };
     }
-    pub fn itemsWithPrefix(self: *const Tensors, allocator: std.mem.Allocator, prefix: ?[]const u8) !std.ArrayList(*const Tensor) {
-        var result = std.ArrayList(*const Tensor).init(allocator);
+    // pub fn itemsWithPrefix(self: *const Tensors, allocator: std.mem.Allocator, prefix: ?[]const u8) !std.ArrayList(*const Tensor) {
+    //     var result = std.ArrayList(*const Tensor).init(allocator);
 
-        for (self.items.items) |*t| {
-            if (prefix == null or std.mem.startsWith(u8, t.name, prefix.?)) {
-                try result.append(t);
-            }
-        }
+    //     for (self.items.items) |*t| {
+    //         if (prefix == null or std.mem.startsWith(u8, t.name, prefix.?)) {
+    //             try result.append(t);
+    //         }
+    //     }
 
-        return result;
-    }
+    //     return result;
+    // }
     pub fn groupLayers(self: Tensors, allocator: std.mem.Allocator) !std.StringHashMapUnmanaged(Layer) {
         var layers = std.StringHashMapUnmanaged(*Layer){};
 
         for (self.items.items) |t| {
-            var parts = std.ArrayList([]const u8).init(allocator);
+            var parts: std.ArrayList([]const u8) = .empty;
             defer parts.deinit();
             try splitDot(allocator, t.name, &parts);
 
@@ -38,8 +38,8 @@ pub const Tensors = struct {
 
                     // Build new parts array with joined prefix + suffix
                     try parts.resize(0);
-                    try parts.append(joined);
-                    for (parts.items[index + 2 ..]) |s| try parts.append(s);
+                    try parts.append(allocator, joined);
+                    for (parts.items[index + 2 ..]) |s| try parts.append(allocator, s);
                 }
             }
 

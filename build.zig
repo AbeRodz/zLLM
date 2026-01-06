@@ -10,7 +10,7 @@ const tokamak = @import("tokamak");
 
 pub const Options = struct {
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Mode,
+    optimize: std.builtin.OptimizeMode,
     source_path: []const u8 = "",
     platform: Platform,
 };
@@ -75,9 +75,13 @@ pub fn build(b: *std.Build) void {
 
     const exe = ctx.b.addExecutable(.{
         .name = "zLLM",
-        .root_source_file = b.path("src/main.zig"),
-        .target = ctx.options.target,
-        .optimize = ctx.options.optimize,
+        .root_module = ctx.b.createModule(.{
+            .root_source_file = ctx.b.path("src/main.zig"),
+            .target = ctx.options.target,
+            .optimize = ctx.options.optimize,
+        }),
+        //.root_source_file = b.path("src/main.zig"),
+
     });
     exe.addIncludePath(ctx.llama.path(&.{"include"}));
     exe.addIncludePath(ctx.llama.path(&.{"common"}));
@@ -107,17 +111,28 @@ pub fn build(b: *std.Build) void {
 
     // Unit tests
     const lib_unit_tests = ctx.b.addTest(.{
-        .root_source_file = ctx.b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = ctx.b.createModule(.{
+            .root_source_file = ctx.b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+
+        // .root_source_file = ctx.b.path("src/root.zig"),
+        // .target = target,
+        // .optimize = optimize,
     });
 
     const run_lib_unit_tests = ctx.b.addRunArtifact(lib_unit_tests);
 
     const exe_unit_tests = ctx.b.addTest(.{
-        .root_source_file = ctx.b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = ctx.b.createModule(.{
+            .root_source_file = ctx.b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        // .root_source_file = ctx.b.path("src/main.zig"),
+        // .target = target,
+        // .optimize = optimize,
     });
 
     const run_exe_unit_tests = ctx.b.addRunArtifact(exe_unit_tests);
