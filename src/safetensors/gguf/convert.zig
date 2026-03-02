@@ -433,7 +433,6 @@ pub fn convertToGGUFFromSafeTensors(
     allocator: std.mem.Allocator,
     metadata: *Metadata,
     safetensors_buffer: []const u8,
-    file_writer: std.io.Writer,
     basename: []const u8,
     architecture: []const u8,
     model_name: []const u8,
@@ -441,7 +440,7 @@ pub fn convertToGGUFFromSafeTensors(
     quant_version: u32,
     out_file: *std.fs.File,
 ) !void {
-    var writer = GGUFWriter.init(file_writer);
+    var writer = GGUFWriter.init(out_file.*);
 
     try writeGGUFHeader(&writer, metadata);
 
@@ -646,17 +645,18 @@ pub fn convert(model_name: []const u8, output_path: []const u8, allocator: std.m
     var metadata = try parseSafetensorsFromBuffer(allocator, model_name, buffer);
     try prepare_metadata(allocator, &metadata, found_model, model_files);
 
-    var output_file = try fs.cwd().createFile(output_path, .{ .read = false, .truncate = true });
+    var output_file = try fs.cwd().createFile(
+        output_path,
+        .{ .read = false, .truncate = true },
+    );
     defer output_file.close();
 
-    const writer = output_file.writer(buffer).interface;
     // Convert to GGUF and write to file
     const tokenizer_path = try found_model.localFilePath(found_model.name, "tokenizer_export.json");
     try convertToGGUFFromSafeTensors(
         allocator,
         &metadata,
         buffer,
-        writer,
         found_model.name,
         found_model.name,
         found_model.name,

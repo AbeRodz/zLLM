@@ -10,7 +10,7 @@ pub const llama = @cImport({
 const llama_model = @import("cTypes.zig");
 const client = @import("../client/client.zig");
 const converter = @import("../safetensors/gguf/convert.zig");
-const common = @import("llama_common.zig");
+//const common = @import("llama_common.zig");
 //TODO modify the types into wrapper around c types
 var message_ring = RingBuffer(llama.struct_llama_chat_message, 32).init();
 
@@ -48,11 +48,12 @@ pub fn loadLlamaModelFromRegistry(model_name: []const u8, allocator: std.mem.All
     }
 
     std.debug.print("loading gguf model: {s}\n", .{gguf_path.?});
+    //llama.ggml_backend_load_all();
     llama.llama_backend_init();
-
     var params = llama_model.default_params();
 
     params.n_gpu_layers = 999;
+    //params.main_gpu = 0;
 
     const model = llama_model.loadModel(gguf_path.?, params);
     if (model == null) {
@@ -492,13 +493,13 @@ pub const StreamIter = struct {
             // Arguments: (batch, tokens ptr, token count, seq_id, logits_pos, is_embd)
             // Using seq_id = i for example (distinct per token in batch)
             // logits_pos = 0 (starting logit position for this token)
-            common.common_batch_add(
-                &self.batch,
-                token,
-                @as(llama.llama_pos, @intCast(n_ctx_used)),
-                &[_]i32{0}, // sequence id (unique per token)
-                true, // logits offset
-            );
+            // common.common_batch_add(
+            //     &self.batch,
+            //     token,
+            //     @as(llama.llama_pos, @intCast(n_ctx_used)),
+            //     &[_]i32{0}, // sequence id (unique per token)
+            //     true, // logits offset
+            // );
         }
 
         if (self.batch.n_tokens == 0) {
@@ -679,6 +680,7 @@ pub fn llama_context(model: *llama_model.LlamaModel, n_ctx: u32) !*llama.struct_
     var ctx_params = llama.llama_context_default_params();
     ctx_params.n_ctx = n_ctx;
     ctx_params.n_batch = @divExact(n_ctx, 2);
+    ctx_params.flash_attn = true;
     const ctx = llama.llama_init_from_model(@ptrCast(model), ctx_params);
     if (ctx == null) {
         std.debug.print("Failed to create llama context", .{});
