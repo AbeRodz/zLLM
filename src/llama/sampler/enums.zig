@@ -5,7 +5,7 @@ pub const CommonGrammarTriggerType = enum {
     COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_START,
 };
 
-const common_sampler_type = enum {
+pub const common_sampler_type = enum {
     COMMON_SAMPLER_TYPE_NONE,
     COMMON_SAMPLER_TYPE_DRY,
     COMMON_SAMPLER_TYPE_TOP_K,
