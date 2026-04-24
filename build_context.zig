@@ -150,7 +150,13 @@ pub const BuildContext = struct {
 
     pub fn flags(ctx: Self) []const []const u8 {
         _ = ctx;
-        return &.{"-fno-sanitize=undefined"};
+        return &.{
+            "-fno-sanitize=undefined",
+            "-DNDEBUG",              // disable assertions in llama.cpp
+            "-O3",                   // max optimisation regardless of Zig build mode
+            "-ffast-math",           // reassociation / reciprocal / fused ops
+            "-fno-finite-math-only", // re-enable INFINITY/NaN (llama.cpp requires them)
+        };
     }
     pub fn common(self: Self, lib: *CompileStep) void {
         lib.linkSystemLibrary("stdc++");

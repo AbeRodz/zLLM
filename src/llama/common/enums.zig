@@ -1,4 +1,4 @@
-const llama_example = enum {
+pub const llama_example = enum {
     LLAMA_EXAMPLE_COMMON,
     LLAMA_EXAMPLE_SPECULATIVE,
     LLAMA_EXAMPLE_MAIN,
@@ -19,7 +19,7 @@ const llama_example = enum {
     LLAMA_EXAMPLE_COUNT,
 };
 
-const common_sampler_type = enum {
+pub const common_sampler_type = enum {
     COMMON_SAMPLER_TYPE_NONE,
     COMMON_SAMPLER_TYPE_DRY,
     COMMON_SAMPLER_TYPE_TOP_K,
@@ -32,22 +32,22 @@ const common_sampler_type = enum {
     COMMON_SAMPLER_TYPE_PENALTIES,
 };
 
-const common_reasoning_format = enum {
+pub const common_reasoning_format = enum {
     COMMON_REASONING_FORMAT_NONE,
     COMMON_REASONING_FORMAT_DEEPSEEK,
 };
-const dimre_method = enum {
+pub const dimre_method = enum {
     DIMRE_METHOD_PCA,
     DIMRE_METHOD_MEAN,
 };
 
-const common_conversation_mode = enum {
+pub const common_conversation_mode = enum {
     COMMON_CONVERSATION_MODE_DISABLED,
     COMMON_CONVERSATION_MODE_ENABLED,
     COMMON_CONVERSATION_MODE_AUTO,
 };
 
-const common_grammar_trigger_type = enum {
+pub const common_grammar_trigger_type = enum {
     COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN,
     COMMON_GRAMMAR_TRIGGER_TYPE_WORD,
     COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN,

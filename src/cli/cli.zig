@@ -3,11 +3,50 @@ const models = @import("../registry/model_registry.zig");
 const client = @import("../client/client.zig");
 const gguf = @import("../llama/gguf_converter.zig");
 const llama = @import("../llama/llama.zig");
+const look = @import("../llama/lookahead.zig").look;
 const tk = @import("tokamak");
 const api = @import("../api/api.zig");
 const ggufType = @import("../ggml/gguf.zig");
 const safetensors = @import("../safetensors/safetensors.zig");
 const converter = @import("../safetensors/gguf/convert.zig");
+const session_manager = @import("../inference/session_manager.zig");
+const errh = @import("../api/error_handler.zig");
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown
+// ---------------------------------------------------------------------------
+
+/// Pointer to the live server so the signal handler can stop it.
+/// Written once before server.start(), never after.
+var g_server: ?*tk.Server = null;
+
+fn onSignal(sig: c_int) callconv(.c) void {
+    _ = sig;
+    // Mark the server as shutting down — acquireSlot() will refuse new work.
+    errh.initiateShutdown();
+    // stop() signals httpz to exit its accept loop, which causes server.start()
+    // to return in the server thread.  deinit() is called later after join().
+    if (g_server) |s| s.stop();
+}
+
+fn setupSignalHandlers() void {
+    const action = std.posix.Sigaction{
+        .handler = .{ .handler = onSignal },
+        .mask = std.mem.zeroes(std.posix.sigset_t),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &action, null);
+    std.posix.sigaction(std.posix.SIG.INT, &action, null);
+}
+
+fn runServerThread(server: *tk.Server) void {
+    server.start() catch |err| {
+        // Connection errors during shutdown are expected — only log real ones.
+        if (!errh.isShuttingDown()) {
+            std.log.err("server fatal error: {}", .{err});
+        }
+    };
+}
 fn get(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     const model_name = args.next() orelse return error.InvalidUsage;
     const threads = try getOptionalThreadArg(args);
@@ -76,19 +115,95 @@ fn convert(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
 
 fn run(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     const model_name = args.next() orelse return error.InvalidUsage;
+    const prompt = args.next(); // optional — null means interactive stdin loop
     const n_ctx = 8192;
-    llama.execute(model_name, n_ctx, allocator) catch |err| {
-        std.debug.print("Error during execution: {}\n", .{err});
+
+    if (prompt) |p| {
+        llama.execute_prompt(model_name, p, n_ctx, allocator) catch |err| {
+            std.debug.print("Error during execution: {}\n", .{err});
+            return err;
+        };
+    } else {
+        llama.execute(model_name, n_ctx, allocator) catch |err| {
+            std.debug.print("Error during execution: {}\n", .{err});
+            return err;
+        };
+    }
+}
+
+fn runlookahead(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
+    const model_name = args.next() orelse return error.InvalidUsage;
+    const prompt = args.next() orelse "Once upon a time";
+
+    const modelInfo = (try models.findModelErrorless(model_name)) orelse {
+        std.debug.print("Unknown model: {s}\n", .{model_name});
+        return error.UnknownModel;
+    };
+
+    // Prefer an already-converted .gguf; fall back to the default path.
+    var gguf_path: []const u8 = try modelInfo.localFilePath(modelInfo.name, "model.gguf");
+    for (modelInfo.files) |file| {
+        if (std.mem.endsWith(u8, file, ".gguf")) {
+            gguf_path = try modelInfo.localFilePath(modelInfo.name, file);
+            break;
+        }
+    }
+
+    look(gguf_path, prompt, allocator) catch |err| {
+        std.debug.print("Error during lookahead execution: {}\n", .{err});
         return err;
     };
 }
-
 fn serve(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     const port_str = args.next() orelse "8080";
     const parsedPort = try std.fmt.parseInt(u16, port_str, 10);
+
+    // Session manager must be ready before the first request arrives.
+    session_manager.globalInit(
+        std.heap.page_allocator,
+        32,   // max_sessions  — each holds one llama_context in VRAM
+        900,  // ttl_seconds   — idle sessions evicted after 15 minutes
+        8192, // n_ctx per session
+    );
+
+    // Register SIGTERM / SIGINT handlers before starting the listener so
+    // no signal is lost during startup.
+    setupSignalHandlers();
+
     APIPresentation(parsedPort);
+
     var server = try tk.Server.init(allocator, api.routes, .{ .listen = .{ .port = parsedPort } });
-    try server.start();
+    defer server.deinit();
+    g_server = &server;
+
+    // Run the HTTP listener in a background thread so the main thread can
+    // handle shutdown coordination without blocking.
+    const server_thread = try std.Thread.spawn(.{}, runServerThread, .{&server});
+
+    std.log.info("server listening on port {d} — send SIGTERM or SIGINT to shut down", .{parsedPort});
+
+    // Park the main thread until a signal fires.
+    while (!errh.isShuttingDown()) {
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+
+    // stop() was already called by the signal handler, which causes
+    // server.start() to return so the server thread can exit cleanly.
+    server_thread.join();
+    g_server = null;
+
+    std.log.info("shutdown: listener stopped — waiting up to 30 s for {d} active request(s)…", .{
+        errh.activeRequests(),
+    });
+
+    const clean = errh.drainRequests(30);
+    if (clean) {
+        std.log.info("shutdown: clean exit", .{});
+    } else {
+        std.log.warn("shutdown: timed out — {d} request(s) still active, forcing exit", .{
+            errh.activeRequests(),
+        });
+    }
 }
 
 pub fn init() !void {
@@ -114,6 +229,8 @@ pub fn init() !void {
         printUsage();
     } else if (std.mem.eql(u8, command, "run")) {
         try run(&args, allocator);
+    } else if (std.mem.eql(u8, command, "run-lookahead")) {
+        try runlookahead(&args, allocator);
     } else if (std.mem.eql(u8, command, "serve")) {
         try serve(&args, allocator);
     } else if (std.mem.eql(u8, command, "read")) {
