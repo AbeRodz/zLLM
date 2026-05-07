@@ -4,13 +4,13 @@ const CommonParamsSampling = @import("../llama_sampler.zig").CommonParamsSamplin
 pub const llama = @cImport({
     @cInclude("llama.h");
 });
-const common_grammar_trigger = struct {
+pub const common_grammar_trigger = struct {
     trigger_type: enums.common_grammar_trigger_type,
     value: []const u8,
     token: llama.llama_token = llama.LLAMA_TOKEN_NULL,
 };
 
-const common_params_speculative = struct {
+pub const common_params_speculative = struct {
     devices: std.ArrayList(llama.ggml_backend_dev_t) = .empty,
     n_ctx: i32 = 0, // draft context size
     n_max: i32 = 16, // max draft tokens
@@ -22,35 +22,36 @@ const common_params_speculative = struct {
     cpuparams_batch: cpu_params = cpu_params{},
     model: common_params_model = common_params_model{},
 };
-
-const common_params_vocoder = struct {
+// End of common_params_speculative struct
+pub const common_params_vocoder = struct {
     model: common_params_model = common_params_model{},
     speaker_file: []const u8 = "", // speaker file path
     use_guide_tokens: bool = false,
 };
 
-const common_params_model = struct {
+// End of common_params_vocoder struct
+pub const common_params_model = struct {
     path: []const u8 = "", // model local path
     url: []const u8 = "", // model url to download
     hf_repo: []const u8 = "", // HF repo
     hf_file: []const u8 = "", // HF file
 };
 
-const common_adapter_lora_info = struct {
+pub const common_adapter_lora_info = struct {
     path: []const u8,
     scale: f32,
     ptr: *llama.llama_adapter_lora,
 };
-const common_control_vector_data = struct {
+pub const common_control_vector_data = struct {
     n_embd: i32,
     data: std.ArrayList(f32) = .empty,
 };
-const common_control_vector_load_info = struct {
+pub const common_control_vector_load_info = struct {
     strength: f32,
     fname: []const u8,
 };
 
-const cpu_params = struct {
+pub const cpu_params = struct {
     n_threads: i32 = -1,
     cpumask: [llama.GGML_MAX_N_THREADS]bool = [_]bool{false} ** llama.GGML_MAX_N_THREADS,
     mask_valid: bool = false,
@@ -79,14 +80,14 @@ pub const CommonParams = struct {
     yarn_beta_slow: f32 = 1.0,
     yarn_orig_ctx: i32 = 0,
     defrag_thold: f32 = 0.1,
-    devices: []llama.ggml_backend_dev_t = undefined,
+    devices: []llama.ggml_backend_dev_t = &.{},
     n_gpu_layers: i32 = -1,
     main_gpu: i32 = 0,
     tensor_split: [128]f32 = [_]f32{0} ** 128,
     split_mode: llama.enum_llama_split_mode = llama.LLAMA_SPLIT_MODE_LAYER,
     cpuparams: cpu_params = cpu_params{},
     cpuparams_batch: cpu_params = cpu_params{},
-    cb_eval: ?llama.ggml_backend_sched_eval_callback = null,
+    cb_eval: llama.ggml_backend_sched_eval_callback = null,
     cb_eval_user_data: ?*anyopaque = null,
     numa: llama.enum_ggml_numa_strategy = llama.GGML_NUMA_STRATEGY_DISABLED,
     rope_scaling_type: llama.llama_rope_scaling_type = llama.LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
@@ -109,11 +110,11 @@ pub const CommonParams = struct {
     logits_file: []const u8 = "",
     in_files: std.ArrayList([]const u8) = .empty,
     antiprompt: std.ArrayList([]const u8) = .empty,
-    kv_overrides: []llama.llama_model_kv_override = undefined,
-    tensor_buft_overrides: []llama.llama_model_tensor_buft_override = undefined,
+    kv_overrides: std.ArrayList(llama.llama_model_kv_override) = .empty,
+    tensor_buft_overrides: std.ArrayList(llama.llama_model_tensor_buft_override) = .empty,
     lora_init_without_apply: bool = false,
-    lora_adapters: []common_adapter_lora_info = undefined,
-    control_vectors: []common_control_vector_load_info = undefined,
+    lora_adapters: std.ArrayList(common_adapter_lora_info) = .empty,
+    control_vectors: std.ArrayList(common_control_vector_load_info) = .empty,
     verbosity: i32 = 0,
     control_vector_layer_start: i32 = -1,
     control_vector_layer_end: i32 = -1,
@@ -212,4 +213,47 @@ pub const CommonParams = struct {
     spm_infill: bool = false,
     batched_bench_output_jsonl: bool = false,
     out_file: []const u8 = undefined,
+};
+
+pub const llama_context_params = struct {
+    n_ctx: u32, // text context, 0 = from model
+    n_batch: u32, // logical maximum batch size that can be submitted to llama_decode
+    n_ubatch: u32, // physical maximum batch size
+    n_seq_max: u32, // max number of sequences (i.e. distinct states for recurrent models)
+    n_threads: i32, // number of threads to use for generation
+    n_threads_batch: i32, // number of threads to use for batch processing
+
+    rope_scaling_type: llama.llama_rope_scaling_type, // RoPE scaling type, from `enum llama_rope_scaling_type`
+    pooling_type: llama.enum_llama_pooling_type, // whether to pool (sum) embedding results by sequence id
+    attention_type: llama.llama_attention_type, // attention type to use for embeddings
+
+    // ref: https://github.com/ggml-org/llama.cpp/pull/2054
+    rope_freq_base: f32, // RoPE base frequency, 0 = from model
+    rope_freq_scale: f32, // RoPE frequency scaling factor, 0 = from model
+    yarn_ext_factor: f32, // YaRN extrapolation mix factor, negative = from model
+    yarn_attn_factor: f32, // YaRN magnitude scaling factor
+    yarn_beta_fast: f32, // YaRN low correction dim
+    yarn_beta_slow: f32, // YaRN high correction dim
+    yarn_orig_ctx: u32, // YaRN original context size
+    defrag_thold: f32, // defragment the KV cache if holes/size > thold, < 0 disabled (default)
+
+    cb_eval: ?llama.ggml_backend_sched_eval_callback = null,
+    cb_eval_user_data: ?*anyopaque = null,
+
+    type_k: llama.enum_ggml_type, // data type for K cache [EXPERIMENTAL]
+    type_v: llama.enum_ggml_type, // data type for V cache [EXPERIMENTAL]
+
+    // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
+    // TODO: move at the end of the struct
+    logits_all: bool, // the llama_decode() call computes all logits, not just the last one (DEPRECATED - set llama_batch.logits instead)
+    embeddings: bool, // if true, extract embeddings (together with logits)
+    offload_kqv: bool, // whether to offload the KQV ops (including the KV cache) to GPU
+    flash_attn: bool, // whether to use flash attention [EXPERIMENTAL]
+    no_perf: bool, // whether to measure performance timings
+
+    // Abort callback
+    // if it returns true, execution of llama_decode() will be aborted
+    // currently works only with CPU execution
+    abort_callback: ?llama.ggml_abort_callback = null,
+    abort_callback_data: ?*anyopaque = null,
 };

@@ -1,6 +1,20 @@
 const std = @import("std");
 const registry = @import("../../registry/model_registry.zig");
 
+/// Matches the OpenAI  GET /v1/models  individual model object.
+pub const ModelObject = struct {
+    id: []const u8,
+    object: []const u8 = "model",
+    created: i64,
+    owned_by: []const u8 = "local",
+};
+
+/// Matches the OpenAI  GET /v1/models  response envelope.
+pub const AvailableModelsResponse = struct {
+    object: []const u8 = "list",
+    data: []ModelObject,
+};
+
 pub fn AvailableModels(allocator: std.mem.Allocator) !AvailableModelsResponse {
     const models = registry.listAvailableModels(allocator) catch |err| {
         std.debug.print("Error listing models: {}\n", .{err});
@@ -8,20 +22,17 @@ pub fn AvailableModels(allocator: std.mem.Allocator) !AvailableModelsResponse {
     };
     defer allocator.free(models);
 
-    var available_models = try std.ArrayListUnmanaged([]const u8).initCapacity(
-        allocator,
-        models.len,
-    );
+    var model_list = try std.ArrayListUnmanaged(ModelObject).initCapacity(allocator, models.len);
+    const now = std.time.timestamp();
 
     for (models) |model| {
-        try available_models.append(allocator, model.name);
+        try model_list.append(allocator, ModelObject{
+            .id = model.name,
+            .created = now,
+        });
     }
 
     return AvailableModelsResponse{
-        .available_models = available_models.items,
+        .data = model_list.items,
     };
 }
-
-pub const AvailableModelsResponse = struct {
-    available_models: [][]const u8,
-};

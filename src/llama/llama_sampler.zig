@@ -56,7 +56,7 @@ pub const CommonParamsSampling = struct {
     grammar_triggers: []const types.common_grammar_trigger = &.{},
     preserved_tokens: std.AutoHashMap(llama.llama_token, void) = undefined, // or use ArrayList if order matters
 
-    logit_bias: std.ArrayList(llama.llama_logit_bias) = &.{},
+    logit_bias: std.ArrayList(llama.llama_logit_bias) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) !CommonParamsSampling {
         return CommonParamsSampling{
@@ -83,7 +83,7 @@ pub const CommonSampler = struct {
 
     prev: RingBuffer(llama.llama_token, 64), // You must define or import RingBuffer
 
-    cur: std.ArrayList(llama.llama_token_data),
+    cur: std.ArrayListUnmanaged(llama.llama_token_data),
     cur_p: llama.llama_token_data_array,
 
     pub fn init(allocator: std.mem.Allocator, model: *const llama.llama_model, params: CommonParamsSampling) !*CommonSampler {
@@ -91,47 +91,47 @@ pub const CommonSampler = struct {
         var lparams = llama.llama_sampler_chain_default_params();
         lparams.no_perf = params.no_perf;
 
-        var grmr: *llama.llama_sampler = undefined;
+        var grmr: ?*llama.llama_sampler = null;
 
         // Handle grammar initialization
         // if (std.mem.startsWith(u8, params.grammar, "%llguidance")) {
         //     // Ensure LLAMA_USE_LLGUIDANCE is enabled in your build
         //     //grmr = llama.llama_sampler_init_llg(vocab, "lark", params.grammar.ptr);
         // } else {
-        var patterns_at_start = std.ArrayList([]const u8).init(allocator);
-        var patterns_anywhere = std.ArrayList([]const u8).init(allocator);
-        var trigger_tokens = std.ArrayList(llama.llama_token).init(allocator);
+        var patterns_at_start: std.ArrayList([]const u8) = .empty;
+        var patterns_anywhere: std.ArrayList([]const u8) = .empty;
+        var trigger_tokens: std.ArrayList(llama.llama_token) = .empty;
 
         for (params.grammar_triggers) |trigger| {
             switch (trigger.common_grammar_trigger_type) {
                 .COMMON_GRAMMAR_TRIGGER_TYPE_WORD => {
-                    try patterns_anywhere.append(try regexEscape(trigger.value));
+                    try patterns_anywhere.append(allocator, try regexEscape(trigger.value));
                 },
                 .COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN, .COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_START => {
                     if (trigger.common_grammar_trigger_type == .COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_START) {
-                        try patterns_at_start.append(trigger.value);
+                        try patterns_at_start.append(allocator, trigger.value);
                     } else {
-                        try patterns_anywhere.append(trigger.value);
+                        try patterns_anywhere.append(allocator, trigger.value);
                     }
                 },
                 .COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN => {
-                    try trigger_tokens.append(trigger.token);
+                    try trigger_tokens.append(allocator, trigger.token);
                 },
             }
 
-            var trigger_patterns = std.ArrayList([]const u8).init(allocator);
+            var trigger_patterns: std.ArrayList([]const u8) = .empty;
             if (patterns_at_start.items.len > 0) {
                 const pattern = try joinPatterns(allocator, patterns_at_start.items, true);
-                try trigger_patterns.append(pattern);
+                try trigger_patterns.append(allocator, pattern);
             }
             if (patterns_anywhere.items.len > 0) {
                 const pattern = try joinPatterns(allocator, patterns_anywhere.items, false);
-                try trigger_patterns.append(pattern);
+                try trigger_patterns.append(allocator, pattern);
             }
 
-            var trigger_patterns_c = std.ArrayList([*c]const u8).init(allocator);
+            var trigger_patterns_c: std.ArrayList([*c]const u8) = .empty;
             for (trigger_patterns.items) |regex| {
-                try trigger_patterns_c.append(regex.ptr);
+                try trigger_patterns_c.append(allocator, regex.ptr);
             }
 
             if (params.grammar_lazy) {
@@ -155,7 +155,7 @@ pub const CommonSampler = struct {
 
         const chain = llama.llama_sampler_chain_init(lparams);
         const prev = RingBuffer(llama.llama_token, 64).init(); // should be @max(32, params.n_prev) but comptime
-        const cur = std.ArrayList(llama.llama_token_data).init(allocator);
+        const cur: std.ArrayListUnmanaged(llama.llama_token_data) = .empty;
         const cur_p = llama.llama_token_data_array{
             .data = null,
             .size = 0,
@@ -176,8 +176,8 @@ pub const CommonSampler = struct {
         // Add logit bias sampler
         llama.llama_sampler_chain_add(sampler.chain, llama.llama_sampler_init_logit_bias(
             llama.llama_vocab_n_tokens(vocab),
-            @as(i32, @intCast(params.logit_bias.len)),
-            params.logit_bias.ptr,
+            @as(i32, @intCast(params.logit_bias.items.len)),
+            params.logit_bias.items.ptr,
         ));
 
         // Add other samplers based on params
@@ -191,9 +191,9 @@ pub const CommonSampler = struct {
                     switch (cnstr) {
                         .COMMON_SAMPLER_TYPE_NONE => {},
                         .COMMON_SAMPLER_TYPE_DRY => {
-                            var c_breakers = std.ArrayList([*c]const u8).init(allocator);
+                            var c_breakers: std.ArrayList([*c]const u8) = .empty;
                             for (params.dry_sequence_breakers) |str| {
-                                try c_breakers.append(str.ptr);
+                                try c_breakers.append(allocator, str.ptr);
                             }
                             llama.llama_sampler_chain_add(sampler.chain, llama.llama_sampler_init_dry(
                                 vocab,
@@ -271,23 +271,23 @@ fn regexEscape(input: []const u8) ![]const u8 {
 
 // Helper function to join patterns
 fn joinPatterns(allocator: std.mem.Allocator, patterns: [][]const u8, at_start: bool) ![]const u8 {
-    var joined = std.ArrayList(u8).init(allocator);
+    var joined: std.ArrayList(u8) = .empty;
     if (at_start) {
-        try joined.appendSlice("^(");
+        try joined.appendSlice(allocator, "^(");
     } else {
-        try joined.appendSlice("^[\\s\\S]*?(");
+        try joined.appendSlice(allocator, "^[\\s\\S]*?(");
     }
     for (0.., patterns) |i, pattern| {
         if (i > 0) {
-            try joined.appendSlice("|");
+            try joined.appendSlice(allocator, "|");
         }
-        try joined.appendSlice(pattern);
+        try joined.appendSlice(allocator, pattern);
     }
-    try joined.appendSlice(")[\\s\\S]*");
+    try joined.appendSlice(allocator, ")[\\s\\S]*");
     return joined.toOwnedSlice(allocator);
 }
 
-pub fn setLogits(self: *CommonSampler, ctx: *llama.llama_context, idx: i32) !void {
+pub fn setLogits(allocator: std.mem.Allocator, self: *CommonSampler, ctx: *llama.llama_context, idx: i32) !void {
     const logits = llama.llama_get_logits_ith(ctx, idx);
 
     const model = llama.llama_get_model(ctx);
@@ -295,7 +295,7 @@ pub fn setLogits(self: *CommonSampler, ctx: *llama.llama_context, idx: i32) !voi
 
     const n_vocab = llama.llama_vocab_n_tokens(vocab);
 
-    try self.cur.resize(@as(usize, @intCast(n_vocab)));
+    try self.cur.resize(allocator, @as(usize, @intCast(n_vocab)));
 
     var token_id: llama.llama_token = 0;
     while (token_id < n_vocab) : (token_id += 1) {
@@ -314,55 +314,45 @@ pub fn setLogits(self: *CommonSampler, ctx: *llama.llama_context, idx: i32) !voi
     };
 }
 
-pub fn common_sampler_sample(self: *CommonSampler, ctx: *llama.llama_context, idx: i32, grammar_first: bool) llama.llama_token {
-    setLogits(self, ctx, idx) catch unreachable;
+pub fn common_sampler_sample(allocator: std.mem.Allocator, self: *CommonSampler, ctx: *llama.llama_context, idx: i32, grammar_first: bool) llama.llama_token {
+    setLogits(allocator, self, ctx, idx) catch unreachable;
 
-    const grmr = self.grmr orelse unreachable;
     const chain = self.chain orelse unreachable;
     const cur_p = &self.cur_p;
 
+    // Apply grammar first (only when a grammar sampler exists).
     if (grammar_first) {
-        llama.llama_sampler_apply(grmr, cur_p);
+        if (self.grmr) |grmr| llama.llama_sampler_apply(grmr, cur_p);
     }
 
     llama.llama_sampler_apply(chain, cur_p);
     std.debug.assert(cur_p.selected != -1);
-    //    GGML_ASSERT(cur_p.selected != -1, "no selected token during sampling - check your sampling configuration");
 
     const id = cur_p.data[@as(usize, @intCast(cur_p.selected))].id;
 
-    if (grammar_first) {
-        return id;
-    }
+    // If grammar was applied first, we're done.
+    if (grammar_first) return id;
 
-    // Grammar validation of sampled token
-    var single_token_data = llama.llama_token_data{
-        .id = id,
-        .logit = 1.0,
-        .p = 0.0,
-    };
+    // No grammar → just return the sampled token.
+    const grmr = self.grmr orelse return id;
 
+    // Grammar validation: check whether the sampled token is grammar-valid.
+    var single_token_data = llama.llama_token_data{ .id = id, .logit = 1.0, .p = 0.0 };
     var single_token_data_array = llama.llama_token_data_array{
         .data = &single_token_data,
         .size = 1,
         .sorted = false,
-        .selected = -1, // if your struct has this field
+        .selected = -1,
     };
-
     llama.llama_sampler_apply(grmr, &single_token_data_array);
 
     const is_valid = single_token_data_array.data[0].logit != -std.math.inf(f32);
-    if (is_valid) {
-        return id;
-    }
+    if (is_valid) return id;
 
-    // Resample: re-run full sampling with grammar first
-    setLogits(self, ctx, idx) catch unreachable;
-
+    // Token failed grammar check — resample with grammar applied first.
+    setLogits(allocator, self, ctx, idx) catch unreachable;
     llama.llama_sampler_apply(grmr, &self.cur_p);
     llama.llama_sampler_apply(chain, &self.cur_p);
     std.debug.assert(self.cur_p.selected != -1);
-    //GGML_ASSERT(self.cur_p.selected != -1, "no selected token during re-sampling - check your sampling configuration");
-
     return self.cur_p.data[@as(usize, @intCast(self.cur_p.selected))].id;
 }

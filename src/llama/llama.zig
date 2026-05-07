@@ -4,6 +4,9 @@ const registry = @import("../registry/model_registry.zig");
 const registryRuntime = @import("../registry/runtime.zig");
 const sampling = @import("llama_sampler.zig");
 const RingBuffer = @import("../utils/ring_buffer.zig").RingBuffer;
+const session_mgr = @import("../inference/session_manager.zig");
+pub const chat_format = @import("chat_format.zig");
+
 pub const llama = @cImport({
     @cInclude("llama.h");
 });
@@ -51,7 +54,6 @@ pub fn loadLlamaModelFromRegistry(model_name: []const u8, allocator: std.mem.All
     //llama.ggml_backend_load_all();
     llama.llama_backend_init();
     var params = llama_model.default_params();
-
     params.n_gpu_layers = 999;
     //params.main_gpu = 0;
 
@@ -64,26 +66,27 @@ pub fn loadLlamaModelFromRegistry(model_name: []const u8, allocator: std.mem.All
     return model.?;
 }
 
+// ---------------------------------------------------------------------------
+// Chat template helpers
+// ---------------------------------------------------------------------------
+
+/// Push a message onto a caller-owned ring buffer.
+/// The content string is duped into allocator so the ring entry is stable.
 fn appendMessage(
     allocator: std.mem.Allocator,
-    //messages: *std.ArrayList(llama.struct_llama_chat_message),
+    ring: *RingBuffer(llama.struct_llama_chat_message, 32),
     role: [*c]const u8,
     content: []const u8,
 ) !void {
     const dup = try allocator.dupeZ(u8, content);
-    if (!message_ring.push(.{ .role = role, .content = dup.ptr })) {
-        std.log.warn("Message ring full, dropping message", .{});
+    if (!ring.push(.{ .role = role, .content = dup.ptr })) {
+        std.log.warn("message ring full, dropping message", .{});
     }
-
-    // _ = message_ring.push(.{
-    //     .role = role,
-    //     .content = dup.ptr,
-    // });
 }
+
 fn applyChatTemplate(
     allocator: std.mem.Allocator,
     tmpl: [*c]const u8,
-    //messages: std.ArrayList(llama.struct_llama_chat_message),
     messages: *RingBuffer(llama.struct_llama_chat_message, 32),
     formatted: []u8,
 ) ![]u8 {
@@ -123,20 +126,101 @@ fn calculateBufferSize(n_ctx: u32, bytes_per_token: u32, headroom_percent: u32) 
     const base_size = n_ctx * bytes_per_token;
     return base_size + (base_size * headroom_percent / 100);
 }
+
+// ---------------------------------------------------------------------------
+// Public API types
+// ---------------------------------------------------------------------------
+
+/// Structured message passed from the API layer.
+pub const ApiMessage = struct {
+    role: []const u8,
+    content: []const u8,
+};
+
+/// Returned by respondToPrompt; carries the generated text and real token counts.
+pub const PromptResult = struct {
+    content: []u8,
+    prompt_tokens: i32,
+    completion_tokens: i32,
+    /// Non-null when the model output was parsed as a tool call.
+    /// Only populated by respondToPrompt (non-streaming path).
+    tool_call: ?chat_format.ParsedToolCall = null,
+};
+
+/// Hard deadline for a single inference call.
+/// Streaming: checked at the start of every StreamIter.next() call.
+/// Non-streaming: checked at the start of every generate() loop iteration.
+/// Pass std.math.maxInt(i128) to disable (CLI interactive mode).
+pub const INFERENCE_TIMEOUT_NS: i128 = 120 * std.time.ns_per_s;
+
+// ---------------------------------------------------------------------------
+// Non-streaming inference
+// ---------------------------------------------------------------------------
+
 pub fn respondToPrompt(
     allocator: std.mem.Allocator,
     model_name: []const u8,
     n_ctx: u32,
-    prompt: []const u8,
-) ![]u8 {
-    const loaded = try registryRuntime.getOrLoadModel(allocator, model_name, 8192);
+    messages: []const ApiMessage,
+    /// Optional X-Session-ID header value.  When provided the call borrows an
+    /// existing llama_context from the session pool instead of allocating one
+    /// per request, eliminating the Metal KV-cache alloc/free overhead (~50ms).
+    session_id: ?[]const u8,
+    /// Tool definitions for this request.  When non-null a GBNF lazy grammar
+    /// sampler is added to constrain output to a valid tool call JSON once the
+    /// trigger token is emitted.  Pass null for regular (non-tool) requests.
+    tools: ?[]const chat_format.ApiTool,
+) !PromptResult {
+    const loaded = try registryRuntime.getOrLoadModel(allocator, model_name);
     const tmpl = llama.llama_model_chat_template(@ptrCast(loaded.model), null);
-    const sampler = llama_sampler();
+    const family = chat_format.detect(tmpl);
 
-    const bytes_per_token = 4;
-    const headroom = 20;
-    const buffer_size = calculateBufferSize(n_ctx, bytes_per_token, headroom);
-    const backing_mem = try allocator.alloc(u8, buffer_size);
+    // Build the appropriate sampler: with lazy grammar when tools are present,
+    // plain greedy otherwise.
+    const sampler = if (tools != null and tools.?.len > 0) blk: {
+        const vocab = llama.llama_model_get_vocab(@ptrCast(loaded.model));
+        const grammar_z = chat_format.buildGrammar(allocator, tools.?) catch |err| {
+            std.log.warn("grammar build failed ({s}), falling back to greedy sampler", .{@errorName(err)});
+            break :blk llama_sampler();
+        };
+        defer allocator.free(grammar_z);
+        break :blk llamaSamplerWithGrammar(vocab.?, grammar_z, chat_format.triggerPattern(family));
+    } else llama_sampler();
+    defer llama.llama_sampler_free(sampler);
+
+    // ------------------------------------------------------------------
+    // Resolve context: borrow from session pool or allocate fresh
+    // ------------------------------------------------------------------
+    var session: ?*session_mgr.Session = null;
+    var owns_ctx = false;
+
+    const ctx: *llama.struct_llama_context = blk: {
+        if (session_id) |sid| {
+            const s = session_mgr.acquire(sid, @ptrCast(loaded.model)) catch |err| switch (err) {
+                error.SessionBusy,
+                error.NoSlotAvailable,
+                error.ManagerNotInitialized,
+                => {
+                    std.log.warn("session acquire failed ({s}), using stateless ctx", .{@errorName(err)});
+                    owns_ctx = true;
+                    break :blk try llama_context(@ptrCast(loaded.model), n_ctx);
+                },
+                else => return err,
+            };
+            session = s;
+            break :blk @ptrCast(s.ctx);
+        } else {
+            owns_ctx = true;
+            break :blk try llama_context(@ptrCast(loaded.model), n_ctx);
+        }
+    };
+    defer {
+        if (owns_ctx) llama.llama_free(ctx);
+        if (session) |s| session_mgr.release(s);
+    }
+
+    // FBA only used by applyChatTemplate for its retry buffer (≤ n_ctx bytes).
+    const backing_mem = try allocator.alloc(u8, n_ctx);
     defer allocator.free(backing_mem);
 
     var fixed_buffer_allocator = std.heap.FixedBufferAllocator.init(backing_mem);
@@ -145,18 +229,27 @@ pub fn respondToPrompt(
     const formatted = try allocator.alloc(u8, n_ctx);
     defer allocator.free(formatted);
 
-    try appendMessage(allocator, "user", prompt);
-    const chat_prompt = try applyChatTemplate(fast_alloc, tmpl, &message_ring, formatted);
+    var local_ring = RingBuffer(llama.struct_llama_chat_message, 32).init();
+    for (messages) |msg| {
+        try appendMessage(allocator, &local_ring, msg.role.ptr, msg.content);
+    }
+    const chat_prompt = try applyChatTemplate(fast_alloc, tmpl, &local_ring, formatted);
 
-    // TODO: due to new writer API changes, we use an allocating writer here with fixed temporary capacity.
-    const w = try std.io.Writer.Allocating.initCapacity(allocator, 1024);
-    var writer = w.writer;
+    const deadline = std.time.nanoTimestamp() + INFERENCE_TIMEOUT_NS;
+    var result = try generate(ctx, sampler, @ptrCast(loaded.model), allocator, chat_prompt, null, deadline);
 
-    const response = try generate(@ptrCast(loaded.ctx), sampler, @ptrCast(loaded.model), fast_alloc, chat_prompt, &writer);
-    try appendMessage(allocator, "assistant", response);
+    // Parse tool call from result when tools were declared.
+    if (tools != null and tools.?.len > 0) {
+        result.tool_call = chat_format.parseOutput(allocator, family, result.content);
+    }
 
-    return writer.buffered();
+    return result;
 }
+
+// ---------------------------------------------------------------------------
+// CLI interactive mode
+// ---------------------------------------------------------------------------
+
 pub fn execute_v2(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocator) !void {
     var stdout_buffer: [4028]u8 = undefined;
     var stdin_buffer: [4028]u8 = undefined;
@@ -178,61 +271,44 @@ pub fn execute_v2(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocat
 
     const tmpl = llama.llama_model_chat_template(model_ptr, null);
 
-    const bytes_per_token = 4; // Could tune based on profiling
+    const bytes_per_token = 4;
     const headroom = 100;
-
     const buffer_size = calculateBufferSize(n_ctx, bytes_per_token, headroom);
 
-    // Fixed buffer for temporary allocations
     const backing_mem = try allocator.alloc(u8, buffer_size);
     defer allocator.free(backing_mem);
 
     var fixed_buffer_allocator = std.heap.FixedBufferAllocator.init(backing_mem);
-    //const fast_alloc = fixed_buffer_allocator.allocator();
 
-    // Initialize persistent chat history
-    //const message_ring_local = RingBuffer(llama.struct_llama_chat_message, 32).init();
+    var local_ring = RingBuffer(llama.struct_llama_chat_message, 32).init();
 
     while (true) {
-        // Read user input
         const input = stdin.takeDelimiterExclusive('\n') catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
         };
-        //std.debug.print("User input: {s}", .{input});
         if (input.len == 0) continue;
 
-        // Copy user input into persistent allocator
         const user_copy = try allocator.alloc(u8, input.len);
         @memcpy(user_copy, input);
-        try appendMessage(allocator, "user", user_copy);
+        try appendMessage(allocator, &local_ring, "user", user_copy);
 
-        // Allocate temporary buffer per loop
         const formatted = try allocator.alloc(u8, buffer_size);
+        const prompt = try applyChatTemplate(allocator, tmpl, &local_ring, formatted);
 
-        // Build prompt using persistent message_ring + temporary buffer
-        const prompt = try applyChatTemplate(
-            allocator,
-            tmpl,
-            &message_ring, // pass by pointer!
-            formatted,
-        );
+        const result = try generate(ctx, sampler, @ptrCast(model), allocator, prompt, stdout, std.math.maxInt(i128));
 
-        // Generate model response
-        const response = try generate(ctx, sampler, @ptrCast(model), allocator, prompt, stdout);
-
-        // Copy response to persistent allocator
-        const assistant_copy = try allocator.alloc(u8, response.len);
-        @memcpy(assistant_copy, response);
-        try appendMessage(allocator, "assistant", assistant_copy);
+        const assistant_copy = try allocator.alloc(u8, result.content.len);
+        @memcpy(assistant_copy, result.content);
+        try appendMessage(allocator, &local_ring, "assistant", assistant_copy);
 
         try stdout.print("\n", .{});
         try stdout.flush();
 
-        // Reset temporary allocator for next iteration
         fixed_buffer_allocator.reset();
     }
 }
+
 pub fn execute(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocator) !void {
     var stdout_buffer: [4028]u8 = undefined;
     var stdin_buffer: [4028]u8 = undefined;
@@ -256,66 +332,89 @@ pub fn execute(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocator)
 
     const bytes_per_token = 4;
     const headroom = 20;
-
     const buffer_size = calculateBufferSize(n_ctx, bytes_per_token, headroom);
-    //const buffer_size = n_ctx * bytes_per_token * 500; // 50x headroom
 
-    // Fixed buffer for temporary allocations
     const backing_mem = try allocator.alloc(u8, buffer_size * 100);
     defer allocator.free(backing_mem);
     var fixed_buffer_allocator = std.heap.FixedBufferAllocator.init(backing_mem);
     const fast_alloc = fixed_buffer_allocator.allocator();
 
+    var local_ring = RingBuffer(llama.struct_llama_chat_message, 32).init();
+
     while (stdin.takeDelimiterExclusive('\n')) |input| {
         stdin.toss(1);
-
         if (input.len == 0) continue;
 
-        // Copy user input into persistent allocator
-        //const user_copy = try allocator.alloc(u8, input.len);
-        //@memcpy(user_copy, input);
-        try appendMessage(allocator, "user", input);
+        try appendMessage(allocator, &local_ring, "user", input);
 
-        // Allocate temporary buffer per iteration
         const formatted = try fast_alloc.alloc(u8, buffer_size);
         defer fast_alloc.free(formatted);
-        // Build prompt
-        const prompt = try applyChatTemplate(
-            fast_alloc,
-            tmpl,
-            &message_ring,
-            formatted,
-        );
+        const prompt = try applyChatTemplate(fast_alloc, tmpl, &local_ring, formatted);
 
-        // Generate response
         try stdout.print("\x1b[33m", .{});
-        const response = try generate(ctx, sampler, @ptrCast(model), fast_alloc, prompt, stdout);
+        const result = try generate(ctx, sampler, @ptrCast(model), fast_alloc, prompt, stdout, std.math.maxInt(i128));
 
-        // Copy response to persistent allocator
-        //const assistant_copy = try fast_alloc.alloc(u8, response.len);
-        //@memcpy(assistant_copy, response);
-        try appendMessage(allocator, "assistant", response);
+        try appendMessage(allocator, &local_ring, "assistant", result.content);
 
         try stdout.print("\n", .{});
         try stdout.flush();
         fixed_buffer_allocator.reset();
-
-        // Reset temporary allocator for next iteration
-        //   fixed_buffer_allocator.reset();
     } else |err| switch (err) {
-        error.EndOfStream => {
-            // reached end
-            // the normal case
-        },
-        error.StreamTooLong => {
-            // the line was longer than the internal buffer
-            return err;
-        },
-        error.ReadFailed => {
-            // the read failed
-            return err;
-        },
+        error.EndOfStream => {},
+        error.StreamTooLong => return err,
+        error.ReadFailed => return err,
     }
+}
+
+/// Single-shot generation: apply a chat template to `prompt`, generate tokens,
+/// stream them to stdout, then print timing stats identical to run-lookahead.
+pub fn execute_prompt(model_name: []const u8, prompt: []const u8, n_ctx: u32, allocator: std.mem.Allocator) !void {
+    var stdout_buffer: [4028]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    const model = try loadLlamaModelFromRegistry(model_name, allocator);
+    const model_ptr: ?*llama.struct_llama_model = @ptrCast(model);
+    defer llama.llama_free_model(model_ptr);
+
+    const ctx = try llama_context(model, n_ctx);
+    defer llama.llama_free(ctx);
+
+    const sampler = llama_sampler();
+    defer llama.llama_sampler_free(sampler);
+
+    const tmpl = llama.llama_model_chat_template(model_ptr, null);
+
+    const bytes_per_token = 4;
+    const headroom = 20;
+    const buffer_size = calculateBufferSize(n_ctx, bytes_per_token, headroom);
+
+    const backing_mem = try allocator.alloc(u8, buffer_size * 100);
+    defer allocator.free(backing_mem);
+    var fba = std.heap.FixedBufferAllocator.init(backing_mem);
+    const fast_alloc = fba.allocator();
+
+    var ring = RingBuffer(llama.struct_llama_chat_message, 32).init();
+    try appendMessage(allocator, &ring, "user", prompt);
+
+    const formatted = try fast_alloc.alloc(u8, buffer_size);
+    const full_prompt = try applyChatTemplate(fast_alloc, tmpl, &ring, formatted);
+
+    const t_start = std.time.nanoTimestamp();
+
+    try stdout.print("\x1b[33m", .{});
+    const result = try generate(ctx, sampler, @ptrCast(model), fast_alloc, full_prompt, stdout, std.math.maxInt(i128));
+    try stdout.print("\x1b[0m\n\n", .{});
+    try stdout.flush();
+
+    const t_end = std.time.nanoTimestamp();
+    const elapsed_s = @as(f64, @floatFromInt(t_end - t_start)) / 1e9;
+
+    std.debug.print("decoded {d} tokens in {d:.3} s, speed: {d:.3} t/s (greedy)\n", .{
+        result.completion_tokens,
+        elapsed_s,
+        @as(f64, @floatFromInt(result.completion_tokens)) / elapsed_s,
+    });
 }
 
 pub fn execute_og(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocator) !void {
@@ -339,9 +438,8 @@ pub fn execute_og(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocat
 
     const tmpl = llama.llama_model_chat_template(model_ptr, null);
 
-    const bytes_per_token = 4; // Could tune based on profiling
+    const bytes_per_token = 4;
     const headroom = 20;
-
     const buffer_size = calculateBufferSize(n_ctx, bytes_per_token, headroom);
 
     const backing_mem = try allocator.alloc(u8, buffer_size);
@@ -351,73 +449,58 @@ pub fn execute_og(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocat
     const fast_alloc = fixed_buffer_allocator.allocator();
 
     const formatted = try fast_alloc.alloc(u8, buffer_size);
-    defer allocator.free(formatted);
 
-    // Greeting
-    //const init_prompt = "Please greet the user.";
-    //try appendMessage(allocator, "user", init_prompt);
+    var local_ring = RingBuffer(llama.struct_llama_chat_message, 32).init();
 
-    //const greeting_prompt = try applyChatTemplate(fast_alloc, tmpl, message_ring, formatted);
-    // try stdout.print("\x1b[33m", .{});
-    // const greeting_response = try generate(ctx, sampler, @ptrCast(model), fast_alloc, greeting_prompt, stdout);
-    // try stdout.print("\n\x1b[0m", .{});
-    // try stdout.flush();
-    // try appendMessage(allocator, "assistant", greeting_response);
-
-    // Chat Loop
     while (true) {
-        //try stdout.print("\x1b[32m> \x1b[0m", .{});
-
-        // const input = try stdin.takeDelimiterExclusive('\n');
-        // if (input == null or input.len == 0) continue;
         const input = stdin.takeDelimiterExclusive('\n') catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
         };
+        if (input.len == 0) continue;
 
-        // IMPORTANT: ignore empty lines
-        if (input.len == 0) {
-            continue;
-        }
+        try appendMessage(allocator, &local_ring, "user", input);
+        const prompt = try applyChatTemplate(fast_alloc, tmpl, &local_ring, formatted);
 
-        try appendMessage(allocator, "user", input);
-
-        const prompt = try applyChatTemplate(
-            fast_alloc,
-            tmpl,
-            &message_ring,
-            formatted,
-        );
-
-        //try stdout.print("\x1b[33m", .{});
-        const response = try generate(ctx, sampler, @ptrCast(model), fast_alloc, prompt, stdout);
-        //try stdout.print("\n\x1b[0m", .{});
-        try appendMessage(allocator, "assistant", response);
-        //try stdout.print("{d}", .{message_ring.count});
+        const result = try generate(ctx, sampler, @ptrCast(model), fast_alloc, prompt, stdout);
+        try appendMessage(allocator, &local_ring, "assistant", result.content);
         try stdout.print("\n", .{});
         try stdout.flush();
-        // Reset the allocator after each loop to reuse the same memory
         fixed_buffer_allocator.reset();
     }
-    //try stdout.flush();
 }
+
+// ---------------------------------------------------------------------------
+// Streaming iterator
+// ---------------------------------------------------------------------------
+
 pub const StreamIter = struct {
     ctx: *llama.struct_llama_context,
-    //sampler: *sampling.CommonSampler,
     sampler: [*c]llama.struct_llama_sampler,
     model: *llama_model.LlamaModel,
     allocator: std.mem.Allocator,
     vocab: *const llama.struct_llama_vocab,
-    // token_cache: std.ArrayList(usize) = std.ArrayList(usize).init(std.heap.page_allocator),
     batch: llama.llama_batch,
     buf: [512]u8 = undefined,
     token_buf: [1]llama.llama_token = undefined,
     is_done: bool = false,
     prompt_token_count: i32,
     completion_token_count: i32 = 0,
+    /// Absolute nanosecond deadline; next() returns InferenceTimeout if exceeded.
+    deadline_ns: i128,
+    /// True when this iterator created its own context (stateless path).
+    /// The context is freed in deinit().
+    owns_ctx: bool,
+    /// Non-null when inference runs inside a session (session path).
+    /// deinit() releases the session back to the manager.
+    session: ?*session_mgr.Session,
 
     pub inline fn next(self: *StreamIter) !?[]const u8 {
         if (self.is_done) return error.EndOfStream;
+        if (std.time.nanoTimestamp() > self.deadline_ns) {
+            self.is_done = true;
+            return error.InferenceTimeout;
+        }
 
         const n_ctx_used = llama.llama_kv_self_used_cells(self.ctx);
         if (n_ctx_used + self.batch.n_tokens > llama.llama_n_ctx(self.ctx)) {
@@ -435,13 +518,12 @@ pub const StreamIter = struct {
             self.is_done = true;
             return error.EndOfStream;
         }
-        //var buf: [256]u8 = undefined;
+
         const len = llama.llama_token_to_piece(self.vocab, token, &self.buf, self.buf.len, 0, true);
         const lenCast = @as(usize, @intCast(len));
         if (len < 0 or lenCast > self.buf.len) {
             self.is_done = true;
             return error.InvalidTokenLength;
-            //return null;
         }
         const slice = self.buf[0..lenCast];
 
@@ -449,43 +531,10 @@ pub const StreamIter = struct {
         const tok = @as([*c]llama.llama_token, &self.token_buf);
         self.batch.token = tok;
         self.batch.n_tokens = 1;
-        //const batch = llama.llama_batch_get_one(tok, 1);
-        //self.batch = batch;
 
         self.completion_token_count += 1;
         return slice;
     }
-    pub fn nextBatchedCommon(self: *StreamIter) !?[]const u8 {
-        if (self.is_done) return null;
-
-        const n_ctx_used = llama.llama_kv_self_used_cells(self.ctx);
-        if (n_ctx_used + self.batch.n_tokens > llama.llama_n_ctx(self.ctx)) {
-            self.is_done = true;
-            return null;
-        }
-        // if (llama.llama_decode(self.ctx, self.batch) != 0) {
-        //     self.is_done = true;
-        //     return null;
-        // }
-        // Batch size for multiple tokens at once
-        const batch_size = 8;
-        var token_buf: [256]u8 = undefined; // max token piece length buffer
-        var tokens: [batch_size]llama.llama_token = undefined; // tokens buffer
-
-        var output: std.ArrayList(u8) = .empty;
-
-        // Clear batch before adding tokens
-        //common.common_batch_clear(&self.batch);
-
-        for (0..batch_size) |i| {
-            //const token = llama.llama_sampler_sample(self.sampler, self.ctx, -1);
-            const token = sampling.common_sampler_sample(self.sampler, self.ctx, -1, true);
-            sampling.common_sampler_accept(self.sampler, token, true);
-            // Stop if end-of-generation token
-            if (llama.llama_vocab_is_eog(self.vocab, token)) {
-                self.is_done = true;
-                break;
-            }
 
             tokens[i] = token;
 
@@ -501,100 +550,152 @@ pub const StreamIter = struct {
             //     true, // logits offset
             // );
         }
-
-        if (self.batch.n_tokens == 0) {
-            // no tokens added - end of generation
-            output.deinit(self.allocator);
-            return null;
+        // Return the session to the pool (session path).
+        if (self.session) |s| {
+            session_mgr.release(s);
         }
-
-        // Run decoding on the batch of tokens
-        if (llama.llama_decode(self.ctx, self.batch) != 0) {
-            self.is_done = true;
-            output.deinit(self.allocator);
-            return null;
-        }
-
-        // For each token, convert to piece and append to output buffer
-        for (0..@as(usize, @intCast(self.batch.n_tokens))) |i| {
-            const len = llama.llama_token_to_piece(self.vocab, tokens[i], &token_buf, token_buf.len, 0, true);
-            if (len < 0 or @as(usize, @intCast(len)) > token_buf.len) {
-                std.debug.print("Invalid token piece length: {}\n", .{len});
-                self.is_done = true;
-                output.deinit(self.allocator);
-                return null;
-            }
-
-            try output.appendSlice(self.allocator, token_buf[0..@as(usize, @intCast(len))]);
-        }
-
-        const result = try output.toOwnedSlice(self.allocator);
-        output.deinit(self.allocator);
-
-        return result;
-    }
-
-    pub fn deinit(_: *StreamIter) void {
-        // No dynamic memory in struct currently might need in the future?
     }
 };
-fn createSeqIds(allocator: std.mem.Allocator, n_parallel: usize) ![]i32 {
-    const seq_ids = try allocator.alloc(i32, n_parallel);
-    for (seq_ids, 0..) |*id, i| {
-        id.* = @as(i32, @intCast(i));
-    }
-    return seq_ids;
-}
 
+// ---------------------------------------------------------------------------
+// Streaming inference — session-aware
+// ---------------------------------------------------------------------------
+
+/// Build a streaming iterator for the given request.
+///
+/// session_id (optional)
+///   When provided, the call attempts to acquire a matching session from the
+///   global SessionManager.  On success, the session's llama_context is reused
+///   and released in StreamIter.deinit().
+///
+///   If the session is busy or the slot cap is exhausted, the call falls back
+///   to creating a temporary context (owns_ctx = true) so the request is never
+///   dropped.
+///
+///   When session_id is null the stateless path is always used.
 pub fn respondToPromptStream(
     allocator: std.mem.Allocator,
     model_name: []const u8,
     n_ctx: u32,
-    prompt: []const u8,
+    messages: []const ApiMessage,
+    session_id: ?[]const u8,
+    /// Tool definitions — when non-null a lazy GBNF grammar sampler is inserted
+    /// before the greedy sampler so the JSON after the trigger token is valid.
+    tools: ?[]const chat_format.ApiTool,
 ) !StreamIter {
-    const loaded = try registryRuntime.getOrLoadModel(allocator, model_name, n_ctx);
+    const loaded = try registryRuntime.getOrLoadModel(allocator, model_name);
     const tmpl = llama.llama_model_chat_template(@ptrCast(loaded.model), null);
-    const sampler = llama_sampler();
-    // const params = common.CommonParams{
-    //     .sampling = .{ .temp = 0.2 },
-    // };
-    //const sampler = try sampling.CommonSampler.init(allocator, loaded.model, params.sampling);
-    const bytes_per_token = 4;
-    const headroom = 20;
-    const buffer_size = calculateBufferSize(n_ctx, bytes_per_token, headroom);
-    const backing_mem = try allocator.alloc(u8, buffer_size);
+    const family = chat_format.detect(tmpl);
+
+    const sampler = if (tools != null and tools.?.len > 0) blk: {
+        const vocab = llama.llama_model_get_vocab(@ptrCast(loaded.model));
+        const grammar_z = chat_format.buildGrammar(allocator, tools.?) catch |err| {
+            std.log.warn("grammar build failed ({s}), falling back to greedy sampler", .{@errorName(err)});
+            break :blk llama_sampler();
+        };
+        defer allocator.free(grammar_z);
+        break :blk llamaSamplerWithGrammar(vocab.?, grammar_z, chat_format.triggerPattern(family));
+    } else llama_sampler();
+
+    // ------------------------------------------------------------------
+    // Resolve context: session-owned or freshly created (stateless)
+    // ------------------------------------------------------------------
+    var session: ?*session_mgr.Session = null;
+    var owns_ctx = false;
+
+    const ctx: *llama.struct_llama_context = blk: {
+        if (session_id) |sid| {
+            const s = session_mgr.acquire(sid, @ptrCast(loaded.model)) catch |err| switch (err) {
+                // Graceful degradation — fall back to a fresh stateless context.
+                error.SessionBusy,
+                error.NoSlotAvailable,
+                error.ManagerNotInitialized,
+                => {
+                    std.log.warn("session acquire failed ({s}), falling back to stateless ctx", .{@errorName(err)});
+                    owns_ctx = true;
+                    const new_ctx = try llama_context(@ptrCast(loaded.model), n_ctx);
+                    break :blk new_ctx;
+                },
+                else => return err,
+            };
+            session = s;
+            // KV already cleared inside session_mgr.acquire().
+            break :blk @ptrCast(s.ctx);
+        } else {
+            owns_ctx = true;
+            break :blk try llama_context(@ptrCast(loaded.model), n_ctx);
+        }
+    };
+
+    // For the stateless path the context is brand new; no clear needed.
+    // For the session path, session_mgr.acquire() already called llama_kv_self_clear().
+
+    // ------------------------------------------------------------------
+    // Build prompt using a local ring — no shared global state
+    // ------------------------------------------------------------------
+    // The FixedBufferAllocator is only used by applyChatTemplate for its
+    // internal retry buffer (≤ n_ctx bytes).  The old formula allocated
+    // n_ctx*bytes_per_token*1.2 ≈ 40 KB; n_ctx bytes is enough.
+    const backing_mem = try allocator.alloc(u8, n_ctx);
 
     var fixed_buffer_allocator = std.heap.FixedBufferAllocator.init(backing_mem);
     const fast_alloc = fixed_buffer_allocator.allocator();
 
     const formatted = try allocator.alloc(u8, n_ctx);
-    try appendMessage(allocator, "user", prompt);
-    const chat_prompt = try applyChatTemplate(fast_alloc, tmpl, &message_ring, formatted);
 
+    var local_ring = RingBuffer(llama.struct_llama_chat_message, 32).init();
+    for (messages) |msg| {
+        try appendMessage(allocator, &local_ring, msg.role.ptr, msg.content);
+    }
+    const chat_prompt = try applyChatTemplate(fast_alloc, tmpl, &local_ring, formatted);
+
+    // ------------------------------------------------------------------
+    // Tokenize
+    // ------------------------------------------------------------------
     const vocab = llama.llama_model_get_vocab(@ptrCast(loaded.model));
-    const is_first = llama.llama_kv_self_used_cells(@ptrCast(loaded.ctx)) == 0;
-    const n_prompt = -llama.llama_tokenize(vocab, chat_prompt.ptr, @as(i32, @intCast(chat_prompt.len)), null, 0, is_first, true);
+
+    const n_prompt = -llama.llama_tokenize(
+        vocab,
+        chat_prompt.ptr,
+        @as(i32, @intCast(chat_prompt.len)),
+        null,
+        0,
+        true,
+        true,
+    );
 
     const prompt_tokens = try allocator.alloc(i32, @as(usize, @intCast(n_prompt)));
-    if (llama.llama_tokenize(vocab, chat_prompt.ptr, @as(i32, @intCast(chat_prompt.len)), prompt_tokens.ptr, @as(i32, @intCast(chat_prompt.len)), is_first, true) < 0) {
+    if (llama.llama_tokenize(
+        vocab,
+        chat_prompt.ptr,
+        @as(i32, @intCast(chat_prompt.len)),
+        prompt_tokens.ptr,
+        @as(i32, @intCast(prompt_tokens.len)),
+        true,
+        true,
+    ) < 0) {
         return error.TokenizationFailed;
     }
-    //const batch = llama.llama_batch_init(n_prompt, 0, 1);
-    const cpu = try std.Thread.getCpuCount();
-    const batches = @as(i32, @intCast(@divFloor(cpu, 4)));
+
     const batch = llama.llama_batch_get_one(prompt_tokens.ptr, n_prompt);
-    llama.llama_set_n_threads(@ptrCast(loaded.ctx), @as(i32, @intCast(cpu)), batches);
+
     return StreamIter{
-        .ctx = @ptrCast(loaded.ctx),
-        //.sampler = sampler,
+        .ctx = ctx,
         .sampler = @ptrCast(sampler),
         .model = @ptrCast(loaded.model),
         .allocator = allocator,
         .vocab = vocab.?,
         .batch = batch,
         .prompt_token_count = n_prompt,
+        .deadline_ns = std.time.nanoTimestamp() + INFERENCE_TIMEOUT_NS,
+        .owns_ctx = owns_ctx,
+        .session = session,
     };
 }
+
+// ---------------------------------------------------------------------------
+// Core generation loop (non-streaming)
+// ---------------------------------------------------------------------------
 
 fn generate(
     ctx: *llama.struct_llama_context,
@@ -602,8 +703,14 @@ fn generate(
     model: *llama.struct_llama_model,
     allocator: std.mem.Allocator,
     prompt: []const u8,
-    writer: *std.io.Writer,
-) ![]u8 {
+    /// Pass a real writer for CLI interactive mode (tokens streamed to stdout).
+    /// Pass null for the HTTP non-streaming path — tokens are collected via
+    /// the PromptResult return value; no writer allocation needed.
+    writer: ?*std.io.Writer,
+    /// Absolute nanosecond deadline from std.time.nanoTimestamp().
+    /// Use std.math.maxInt(i128) to disable (CLI interactive mode).
+    deadline_ns: i128,
+) !PromptResult {
     const vocab = llama.llama_model_get_vocab(model);
 
     const is_first = llama.llama_kv_self_used_cells(ctx) == 0;
@@ -611,7 +718,7 @@ fn generate(
     const prompt_tokens = try allocator.alloc(i32, @as(usize, @intCast(n_prompt)));
     defer allocator.free(prompt_tokens);
 
-    if (llama.llama_tokenize(vocab, prompt.ptr, @as(i32, @intCast(prompt.len)), prompt_tokens.ptr, @as(i32, @intCast(prompt.len)), is_first, true) < 0) {
+    if (llama.llama_tokenize(vocab, prompt.ptr, @as(i32, @intCast(prompt.len)), prompt_tokens.ptr, @as(i32, @intCast(prompt_tokens.len)), is_first, true) < 0) {
         return error.TokenizationFailed;
     }
 
@@ -620,8 +727,11 @@ fn generate(
 
     var batch = llama.llama_batch_get_one(prompt_tokens.ptr, n_prompt);
     var new_token_id: llama.llama_token = undefined;
+    var completion_tokens: i32 = 0;
 
     while (true) {
+        if (std.time.nanoTimestamp() > deadline_ns) return error.InferenceTimeout;
+
         const n_ctx_used = llama.llama_kv_self_used_cells(ctx);
         if (n_ctx_used + batch.n_tokens > llama.llama_n_ctx(ctx)) break;
 
@@ -636,37 +746,51 @@ fn generate(
 
         const slice = buf[0..@as(usize, @intCast(len))];
         try response.appendSlice(allocator, slice);
-        writer.print("{s}", .{slice}) catch |err| {
-            switch (err) {
-                std.io.Writer.Error.WriteFailed => {
-                    std.log.err("Error writing to output: {}\n", .{err});
-                    return err;
-                },
-            }
-        };
-        writer.flush() catch |err| {
-            switch (err) {
-                std.io.Writer.Error.WriteFailed => {
-                    std.log.err("Error flushing to output: {}\n", .{err});
-                    return err;
-                },
-            }
-        };
+        completion_tokens += 1;
+
+        if (writer) |w| {
+            w.print("{s}", .{slice}) catch |err| {
+                switch (err) {
+                    std.io.Writer.Error.WriteFailed => {
+                        std.log.err("Error writing to output: {}\n", .{err});
+                        return err;
+                    },
+                }
+            };
+            w.flush() catch |err| {
+                switch (err) {
+                    std.io.Writer.Error.WriteFailed => {
+                        std.log.err("Error flushing to output: {}\n", .{err});
+                        return err;
+                    },
+                }
+            };
+        }
+
         batch = llama.llama_batch_get_one(&new_token_id, 1);
     }
 
-    return response.toOwnedSlice(allocator);
+    return .{
+        .content = try response.toOwnedSlice(allocator),
+        .prompt_tokens = n_prompt,
+        .completion_tokens = completion_tokens,
+    };
 }
+
+// ---------------------------------------------------------------------------
+// Public helpers
+// ---------------------------------------------------------------------------
 
 pub const Tokenize = struct { vocab: *const llama.struct_llama_vocab, n_prompt: i32, prompt_tokens: []i32 };
 
-pub fn tokenize(model: *llama_model, allocator: std.mem.Allocator, prompt: []const u8) !Tokenize {
+pub fn tokenize(model: *llama_model.LlamaModel, allocator: std.mem.Allocator, prompt: []const u8) !Tokenize {
     const vocab = llama.llama_model_get_vocab(model);
 
     const n_prompt = -llama.llama_tokenize(vocab, prompt.ptr, @as(i32, @intCast(prompt.len)), null, 0, true, true);
     const prompt_tokens = try allocator.alloc(i32, @as(usize, @intCast(n_prompt)));
-    defer allocator.free(prompt_tokens);
-    if (llama.llama_tokenize(vocab, prompt.ptr, @as(i32, @intCast(prompt.len)), prompt_tokens.ptr, @as(i32, @intCast(prompt.len)), true, true) < 0) {
+    // Note: no defer free — caller owns prompt_tokens via the returned Tokenize struct.
+    if (llama.llama_tokenize(vocab, prompt.ptr, @as(i32, @intCast(prompt.len)), prompt_tokens.ptr, n_prompt, true, true) < 0) {
+        allocator.free(prompt_tokens);
         return error.TokenizationFailed;
     }
     return Tokenize{
@@ -677,6 +801,23 @@ pub fn tokenize(model: *llama_model, allocator: std.mem.Allocator, prompt: []con
 }
 
 pub fn llama_context(model: *llama_model.LlamaModel, n_ctx: u32) !*llama.struct_llama_context {
+    const cpu = std.Thread.getCpuCount() catch 4;
+    // Use all physical cores for both generation and batch.
+    // On Apple Silicon, hw.physicalcpu is P+E total.  For small models (≤3B)
+    // E-cores can fully participate; for large models the memory-bandwidth ceiling
+    // is hit before thread count matters.  Matches Ollama's behaviour (n_threads =
+    // n_threads_batch = systemInfo.ThreadCount = total physical cores).
+    const phys_cpu: usize = blk: {
+        if (comptime @import("builtin").os.tag == .macos) {
+            var val: c_uint = 0;
+            var size: usize = @sizeOf(c_uint);
+            if (std.c.sysctlbyname("hw.physicalcpu", &val, &size, null, 0) == 0 and val > 0) {
+                break :blk @as(usize, @intCast(val));
+            }
+        }
+        break :blk cpu;
+    };
+
     var ctx_params = llama.llama_context_default_params();
     ctx_params.n_ctx = n_ctx;
     ctx_params.n_batch = @divExact(n_ctx, 2);
@@ -690,10 +831,42 @@ pub fn llama_context(model: *llama_model.LlamaModel, n_ctx: u32) !*llama.struct_
 }
 
 pub fn llama_sampler() [*c]llama.struct_llama_sampler {
+    // Greedy sampler only: picks argmax and short-circuits the chain.
+    // min_p / temp / dist after greedy are dead code — removed.
     const smpl = llama.llama_sampler_chain_init(llama.llama_sampler_chain_default_params());
     llama.llama_sampler_chain_add(smpl, llama.llama_sampler_init_greedy());
-    llama.llama_sampler_chain_add(smpl, llama.llama_sampler_init_min_p(0.05, 1));
-    llama.llama_sampler_chain_add(smpl, llama.llama_sampler_init_temp(0.8));
-    llama.llama_sampler_chain_add(smpl, llama.llama_sampler_init_dist(llama.LLAMA_DEFAULT_SEED));
+    return smpl;
+}
+
+/// Build a sampler chain with a lazy GBNF grammar sampler followed by greedy.
+///
+/// The grammar is inactive until the model emits text matching `trigger`
+/// (e.g. "<tool_call>").  Once the trigger fires, every subsequent token must
+/// satisfy the grammar — enforcing valid tool-call JSON without constraining
+/// the prefix (think / prose before the tool invocation).
+///
+/// `grammar_z`  — null-terminated GBNF grammar string (caller owns, may free
+///                after this call returns; llama.cpp copies the string).
+/// `trigger`    — null-terminated pattern string matched against accumulated
+///                decoded text; grammar activates on first match.
+pub fn llamaSamplerWithGrammar(
+    vocab: *const llama.struct_llama_vocab,
+    grammar_z: [:0]const u8,
+    trigger: [*:0]const u8,
+) [*c]llama.struct_llama_sampler {
+    const smpl = llama.llama_sampler_chain_init(llama.llama_sampler_chain_default_params());
+    // Must be var so &trigger_patterns coerces to [*c][*c]const u8 (drops const).
+    var trigger_patterns = [_][*c]const u8{trigger};
+    const lazy = llama.llama_sampler_init_grammar_lazy_patterns(
+        vocab,
+        grammar_z.ptr,
+        "root",
+        &trigger_patterns,
+        1,
+        null,
+        0,
+    );
+    llama.llama_sampler_chain_add(smpl, lazy);
+    llama.llama_sampler_chain_add(smpl, llama.llama_sampler_init_greedy());
     return smpl;
 }
