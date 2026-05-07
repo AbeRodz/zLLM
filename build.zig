@@ -57,7 +57,7 @@ pub const Context = struct {
         };
     }
     pub fn link(self: *Self, comp: *CompileStep) void {
-        self.llama.link(comp);
+        self.llama.linkv2(comp);
     }
 };
 pub fn build(b: *std.Build) void {
@@ -80,6 +80,7 @@ pub fn build(b: *std.Build) void {
             .target = ctx.options.target,
             .optimize = ctx.options.optimize,
         }),
+        .use_llvm = true,
         //.root_source_file = b.path("src/main.zig"),
 
     });
@@ -98,6 +99,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("uuid", uuid.module("uuid"));
     tokamak.setup(exe, .{});
 
+    exe.addRPath(.{ .cwd_relative = "llama.cpp/build/bin" });
     ctx.b.installArtifact(exe);
     // Run step
     const run_cmd = ctx.b.addRunArtifact(exe);

@@ -13,11 +13,9 @@ pub const llama = @cImport({
 const llama_model = @import("cTypes.zig");
 const client = @import("../client/client.zig");
 const converter = @import("../safetensors/gguf/convert.zig");
-const common = @import("llama_common.zig");
-
-// NOTE: message_ring is no longer a global.  Each call site creates a local
-// RingBuffer on the stack and passes it explicitly.  This eliminates the
-// shared-state race that corrupted concurrent requests.
+//const common = @import("llama_common.zig");
+//TODO modify the types into wrapper around c types
+var message_ring = RingBuffer(llama.struct_llama_chat_message, 32).init();
 
 pub fn loadLlamaModelFromRegistry(model_name: []const u8, allocator: std.mem.Allocator) !*llama_model.LlamaModel {
     const modelInfo = try registry.findModelErrorless(model_name) orelse return error.UnknownModel;
@@ -53,10 +51,11 @@ pub fn loadLlamaModelFromRegistry(model_name: []const u8, allocator: std.mem.All
     }
 
     std.debug.print("loading gguf model: {s}\n", .{gguf_path.?});
+    //llama.ggml_backend_load_all();
     llama.llama_backend_init();
-
     var params = llama_model.default_params();
     params.n_gpu_layers = 999;
+    //params.main_gpu = 0;
 
     const model = llama_model.loadModel(gguf_path.?, params);
     if (model == null) {
@@ -537,11 +536,19 @@ pub const StreamIter = struct {
         return slice;
     }
 
-    pub fn deinit(self: *StreamIter) void {
-        llama.llama_sampler_free(self.sampler);
-        // Free the context only when we own it (stateless path).
-        if (self.owns_ctx) {
-            llama.llama_free(self.ctx);
+            tokens[i] = token;
+
+            // Add token to batch with common_batch_add
+            // Arguments: (batch, tokens ptr, token count, seq_id, logits_pos, is_embd)
+            // Using seq_id = i for example (distinct per token in batch)
+            // logits_pos = 0 (starting logit position for this token)
+            // common.common_batch_add(
+            //     &self.batch,
+            //     token,
+            //     @as(llama.llama_pos, @intCast(n_ctx_used)),
+            //     &[_]i32{0}, // sequence id (unique per token)
+            //     true, // logits offset
+            // );
         }
         // Return the session to the pool (session path).
         if (self.session) |s| {
@@ -813,15 +820,8 @@ pub fn llama_context(model: *llama_model.LlamaModel, n_ctx: u32) !*llama.struct_
 
     var ctx_params = llama.llama_context_default_params();
     ctx_params.n_ctx = n_ctx;
-    // n_batch must be >= the longest prompt we ever pass to llama_decode in
-    // one call.  Multi-turn conversations accumulate tokens fast; setting it
-    // equal to n_ctx guarantees any valid prompt fits without an assert abort.
-    // llama.cpp internally splits the logical batch into n_ubatch-sized GPU
-    // dispatches, so n_ubatch stays small for efficient decode.
-    ctx_params.n_batch = n_ctx;
-    ctx_params.n_ubatch = 512; // physical micro-batch sent to Metal per dispatch
-    ctx_params.n_threads = @as(i32, @intCast(phys_cpu));
-    ctx_params.n_threads_batch = @as(i32, @intCast(phys_cpu));
+    ctx_params.n_batch = @divExact(n_ctx, 2);
+    ctx_params.flash_attn = true;
     const ctx = llama.llama_init_from_model(@ptrCast(model), ctx_params);
     if (ctx == null) {
         std.debug.print("Failed to create llama context", .{});

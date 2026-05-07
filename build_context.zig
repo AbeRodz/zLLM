@@ -46,6 +46,33 @@ pub const BuildContext = struct {
         const lib = ctx.library();
         comp.linkLibrary(lib);
     }
+    pub fn linkv2(ctx: *Self, comp: *CompileStep) void {
+        if (ctx.platform == .Cuda) {
+            // External CUDA build (CMake)
+
+            comp.linkLibC();
+            comp.linkLibCpp();
+
+            comp.linkSystemLibrary("pthread");
+            comp.linkSystemLibrary("dl");
+            comp.linkSystemLibrary("m");
+
+            // Path where CMake produced .so files
+            comp.addLibraryPath(.{ .cwd_relative = "llama.cpp/build/bin" });
+
+            comp.linkSystemLibrary("llama");
+            comp.linkSystemLibrary("ggml");
+            comp.linkSystemLibrary("ggml-base");
+            comp.linkSystemLibrary("ggml-cpu");
+            comp.linkSystemLibrary("ggml-cuda");
+
+            comp.addRPath(.{ .cwd_relative = "llama.cpp/build/bin" });
+        } else {
+            // Source build (CPU / Metal)
+            const lib = ctx.library();
+            comp.linkLibrary(lib);
+        }
+    }
 
     /// build single library containing everything
     pub fn library(ctx: *Self) *CompileStep {
@@ -161,6 +188,7 @@ pub const BuildContext = struct {
     pub fn common(self: Self, lib: *CompileStep) void {
         lib.linkSystemLibrary("stdc++");
         lib.linkSystemLibrary("pthread");
+        lib.linkSystemLibrary("dl");
         lib.linkSystemLibrary("m");
         lib.linkLibCpp();
         lib.addIncludePath(self.build.path("llama.cpp/common"));
