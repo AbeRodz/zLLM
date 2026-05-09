@@ -297,6 +297,19 @@ pub fn describe(model_name: []const u8, allocator: std.mem.Allocator) !void {
     ggml.printDescriptor(description);
 }
 
+pub fn describePath(path: []const u8, allocator: std.mem.Allocator) !void {
+    const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+    defer file.close();
+
+    const file_size = try file.getEndPos();
+    const buffer = try allocator.alloc(u8, file_size);
+    defer allocator.free(buffer);
+    _ = try file.readAll(buffer);
+
+    const description = try ggml.GGML.describeGGUF(buffer, 4096, allocator);
+    ggml.printDescriptor(description);
+}
+
 pub fn read(model_name: []const u8, allocator: std.mem.Allocator) !void {
     const model = try registry.findModelErrorless(model_name);
     const found_model = model.?;
