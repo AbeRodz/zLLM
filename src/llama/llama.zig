@@ -13,13 +13,16 @@ pub const llama = @cImport({
 const llama_model = @import("cTypes.zig");
 const client = @import("../client/client.zig");
 const converter = @import("../safetensors/gguf/convert.zig");
-//const common = @import("llama_common.zig");
-//TODO modify the types into wrapper around c types
-var message_ring = RingBuffer(llama.struct_llama_chat_message, 32).init();
+const common = @import("llama_common.zig");
 
-pub fn loadLlamaModelFromRegistry(model_name: []const u8, allocator: std.mem.Allocator) !*llama_model.LlamaModel {
+// NOTE: message_ring is no longer a global.  Each call site creates a local
+// RingBuffer on the stack and passes it explicitly.  This eliminates the
+// shared-state race that corrupted concurrent requests.
+
+pub fn loadLlamaModelFromRegistry(model_name: []const u8, qtype: converter.QuantType, allocator: std.mem.Allocator) !*llama_model.LlamaModel {
     const modelInfo = try registry.findModelErrorless(model_name) orelse return error.UnknownModel;
 
+    // Pre-bundled .gguf (downloaded directly, not converted) — use as-is.
     var gguf_path: ?[]const u8 = null;
     for (modelInfo.files) |file| {
         if (std.mem.endsWith(u8, file, ".gguf")) {
@@ -27,35 +30,36 @@ pub fn loadLlamaModelFromRegistry(model_name: []const u8, allocator: std.mem.All
             break;
         }
     }
+
+    // Converted model — filename encodes the quant type.
     if (gguf_path == null) {
-        gguf_path = try modelInfo.localFilePath(modelInfo.name, "model.gguf");
+        const gguf_filename = try std.fmt.allocPrint(allocator, "{s}-{s}.gguf", .{ model_name, @tagName(qtype) });
+        defer allocator.free(gguf_filename);
+        gguf_path = try modelInfo.localFilePath(modelInfo.name, gguf_filename);
     }
+
     const exists = try modelInfo.isCached();
-    if (exists == false) {
+    if (!exists) {
         std.debug.print("Model not cached locally, downloading: {s}\n", .{model_name});
         client.downloader(modelInfo, allocator) catch |err| {
             std.debug.print("Error downloading model: {}\n", .{err});
             return err;
         };
-
-        std.debug.print("Converting... \n", .{});
-        try converter.convert(model_name, gguf_path.?, allocator);
+        std.debug.print("Converting to {s}...\n", .{@tagName(qtype)});
+        try converter.convert(model_name, gguf_path.?, qtype, allocator);
     } else {
-        std.debug.print("gguf_path{s}\n", .{gguf_path.?});
-        const gguf_exists = try modelInfo.isGGUFCached();
-        if (gguf_exists == false) {
-            std.debug.print("Model found but gguf not cached, converting: {s}\n", .{model_name});
-            try converter.convert(model_name, gguf_path.?, allocator);
-        }
+        std.fs.cwd().access(gguf_path.?, .{}) catch {
+            std.debug.print("GGUF not cached for quant={s}, converting...\n", .{@tagName(qtype)});
+            try converter.convert(model_name, gguf_path.?, qtype, allocator);
+        };
         std.debug.print("Model found in cache: {s}\n", .{model_name});
     }
 
     std.debug.print("loading gguf model: {s}\n", .{gguf_path.?});
-    //llama.ggml_backend_load_all();
     llama.llama_backend_init();
+
     var params = llama_model.default_params();
     params.n_gpu_layers = 999;
-    //params.main_gpu = 0;
 
     const model = llama_model.loadModel(gguf_path.?, params);
     if (model == null) {
@@ -259,7 +263,7 @@ pub fn execute_v2(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocat
     var stdin_reader = std.fs.File.stdin().reader(&stdin_buffer);
     const stdin = &stdin_reader.interface;
 
-    const model = try loadLlamaModelFromRegistry(model_name, allocator);
+    const model = try loadLlamaModelFromRegistry(model_name, .f16, allocator);
     const model_ptr: ?*llama.struct_llama_model = @ptrCast(model);
     defer llama.llama_free_model(model_ptr);
 
@@ -309,7 +313,7 @@ pub fn execute_v2(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocat
     }
 }
 
-pub fn execute(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocator) !void {
+pub fn execute(model_name: []const u8, qtype: converter.QuantType, n_ctx: u32, allocator: std.mem.Allocator) !void {
     var stdout_buffer: [4028]u8 = undefined;
     var stdin_buffer: [4028]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
@@ -318,7 +322,7 @@ pub fn execute(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocator)
     var stdin_reader = std.fs.File.stdin().reader(&stdin_buffer);
     const stdin = &stdin_reader.interface;
 
-    const model = try loadLlamaModelFromRegistry(model_name, allocator);
+    const model = try loadLlamaModelFromRegistry(model_name, qtype, allocator);
     const model_ptr: ?*llama.struct_llama_model = @ptrCast(model);
     defer llama.llama_free_model(model_ptr);
 
@@ -368,12 +372,12 @@ pub fn execute(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocator)
 
 /// Single-shot generation: apply a chat template to `prompt`, generate tokens,
 /// stream them to stdout, then print timing stats identical to run-lookahead.
-pub fn execute_prompt(model_name: []const u8, prompt: []const u8, n_ctx: u32, allocator: std.mem.Allocator) !void {
+pub fn execute_prompt(model_name: []const u8, qtype: converter.QuantType, prompt: []const u8, n_ctx: u32, allocator: std.mem.Allocator) !void {
     var stdout_buffer: [4028]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    const model = try loadLlamaModelFromRegistry(model_name, allocator);
+    const model = try loadLlamaModelFromRegistry(model_name, qtype, allocator);
     const model_ptr: ?*llama.struct_llama_model = @ptrCast(model);
     defer llama.llama_free_model(model_ptr);
 
@@ -426,7 +430,7 @@ pub fn execute_og(model_name: []const u8, n_ctx: u32, allocator: std.mem.Allocat
     var stdin_reader = std.fs.File.stdin().reader(&stdin_buffer);
     const stdin = &stdin_reader.interface;
 
-    const model = try loadLlamaModelFromRegistry(model_name, allocator);
+    const model = try loadLlamaModelFromRegistry(model_name, .f16, allocator);
     const model_ptr: ?*llama.struct_llama_model = @ptrCast(model);
     defer llama.llama_free_model(model_ptr);
 
@@ -536,19 +540,11 @@ pub const StreamIter = struct {
         return slice;
     }
 
-            tokens[i] = token;
-
-            // Add token to batch with common_batch_add
-            // Arguments: (batch, tokens ptr, token count, seq_id, logits_pos, is_embd)
-            // Using seq_id = i for example (distinct per token in batch)
-            // logits_pos = 0 (starting logit position for this token)
-            // common.common_batch_add(
-            //     &self.batch,
-            //     token,
-            //     @as(llama.llama_pos, @intCast(n_ctx_used)),
-            //     &[_]i32{0}, // sequence id (unique per token)
-            //     true, // logits offset
-            // );
+    pub fn deinit(self: *StreamIter) void {
+        llama.llama_sampler_free(self.sampler);
+        // Free the context only when we own it (stateless path).
+        if (self.owns_ctx) {
+            llama.llama_free(self.ctx);
         }
         // Return the session to the pool (session path).
         if (self.session) |s| {
@@ -820,8 +816,15 @@ pub fn llama_context(model: *llama_model.LlamaModel, n_ctx: u32) !*llama.struct_
 
     var ctx_params = llama.llama_context_default_params();
     ctx_params.n_ctx = n_ctx;
-    ctx_params.n_batch = @divExact(n_ctx, 2);
-    ctx_params.flash_attn = true;
+    // n_batch must be >= the longest prompt we ever pass to llama_decode in
+    // one call.  Multi-turn conversations accumulate tokens fast; setting it
+    // equal to n_ctx guarantees any valid prompt fits without an assert abort.
+    // llama.cpp internally splits the logical batch into n_ubatch-sized GPU
+    // dispatches, so n_ubatch stays small for efficient decode.
+    ctx_params.n_batch = n_ctx;
+    ctx_params.n_ubatch = 512; // physical micro-batch sent to Metal per dispatch
+    ctx_params.n_threads = @as(i32, @intCast(phys_cpu));
+    ctx_params.n_threads_batch = @as(i32, @intCast(phys_cpu));
     const ctx = llama.llama_init_from_model(@ptrCast(model), ctx_params);
     if (ctx == null) {
         std.debug.print("Failed to create llama context", .{});

@@ -10,7 +10,7 @@
     },
     {
         "name":"gemma3",
-        "base_uri": "https://huggingface.co/google/gemma-3-1b-it/resolve/main/",
+        "base_uri": "https://huggingface.co/google/gemma-3-1b-it/tree/main/",
         "files":[
             "tokenizer.json",
             "tokenizer.model",
@@ -24,7 +24,7 @@
     },
         {
         "name":"smollm2-360",
-        "base_uri": "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/",
+        "base_uri": "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/tree/main/",
         "files":[
             "tokenizer.json",
             "config.json",

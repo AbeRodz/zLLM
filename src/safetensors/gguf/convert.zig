@@ -1,9 +1,17 @@
 const std = @import("std");
+
+pub const QuantType = enum {
+    f16,
+    q8_0,
+    q4_k,
+};
+
 const GGUFWriter = @import("../../ggml/writer.zig").GGUFWriter;
 const Value = @import("../../ggml/KV.zig").Value;
 const registry = @import("../../registry/model_registry.zig");
 const TensorNameMap = @import("../../ggml/tensor_map.zig").TensorNameMap;
 const ModelArch = @import("../../ggml/constants.zig").ModelArch;
+const ModelArchNames = @import("../../ggml/constants.zig").ModelArchNames;
 const Metadata = @import("../metadata.zig").Metadata;
 const TensorInfo = @import("../tensor_info.zig").TensorInfo;
 const utils = @import("utils.zig");
@@ -15,17 +23,57 @@ const parseSafetensorsFromBuffer = @import("../safetensors.zig").parseSafetensor
 const ggufPadding = @import("../../ggml/gguf.zig").ggufPadding;
 const getTensorNameMap = @import("../../ggml/tensor_map.zig").getTensorNameMap;
 const writeSentencePieceTokenizerVocab = @import("general.zig").writeSentencePieceTokenizerVocab;
+const writeBPETokenizerVocab = @import("general.zig").writeBPETokenizerVocab;
 const writeGeneralMetadata = @import("general.zig").writeGeneralMetadata;
 
-fn writeGGUFHeader(writer: *GGUFWriter, metadata: *Metadata) !void {
+/// Describes which tokenizer files are present and how many GGUF KV entries
+/// the tokenizer writer will produce.  The caller passes this to writeGGUFHeader
+/// so the count in the file header is always exact.
+const TokenizerSpec = union(enum) {
+    /// SentencePiece export JSON (tokenizer_export.json)
+    sentencepiece: []const u8,
+    /// HuggingFace BPE (tokenizer.json + tokenizer_config.json)
+    bpe: struct { json: []const u8, config: []const u8 },
+
+    fn kvCount(self: TokenizerSpec) u64 {
+        return switch (self) {
+            .sentencepiece => 13,
+            .bpe => 9,
+        };
+    }
+};
+
+/// Map a HuggingFace model_type string to the GGUF ModelArch enum.
+/// Falls back to LLAMA for unknown types (most modern HF models are LLaMA-style).
+fn archFromModelType(model_type: []const u8) ModelArch {
+    const map = .{
+        .{ "llama",       ModelArch.LLAMA   },
+        .{ "mistral",     ModelArch.LLAMA   },
+        .{ "gemma",       ModelArch.GEMMA   },
+        .{ "gemma2",      ModelArch.GEMMA2  },
+        .{ "gemma3",      ModelArch.GEMMA3  },
+        .{ "gemma3_text", ModelArch.GEMMA3  },
+        .{ "qwen2",       ModelArch.QWEN2   },
+        .{ "phi",         ModelArch.PHI2    },
+        .{ "phi3",        ModelArch.PHI3    },
+        .{ "starcoder2",  ModelArch.STARCODER2 },
+        .{ "falcon",      ModelArch.FALCON  },
+        .{ "gpt2",        ModelArch.GPT2    },
+        .{ "gpt_neox",    ModelArch.GPTNEOX },
+    };
+    inline for (map) |entry| {
+        if (std.mem.eql(u8, model_type, entry[0])) return entry[1];
+    }
+    return .LLAMA;
+}
+
+fn writeGGUFHeader(writer: *GGUFWriter, metadata: *Metadata, tokenizer_kv_count: u64) !void {
     const version: u32 = 3;
     try writer.writer.writeAll("GGUF");
     writer.advance(4);
     try writer.writeU32(version);
     try writer.writeU64(@as(u64, metadata.tensors.items.len));
-    // TODO fix dynamic counts
     const general_kv_count: u64 = 5;
-    const tokenizer_kv_count: u64 = 13;
     const metadata_kv_count = @as(u64, metadata.metadata.count());
     const total_kv_count = general_kv_count + tokenizer_kv_count + metadata_kv_count;
     try writer.writeU64(total_kv_count);
@@ -44,12 +92,33 @@ fn writeExtraMetadataKV(writer: *GGUFWriter, metadata: *Metadata) !void {
     }
 }
 
+/// Reorder Q or K rows in-place for llama.cpp's NeoX RoPE convention.
+/// HuggingFace stores each head's rotary pairs as [0..half, half..dim],
+/// llama.cpp expects them interleaved as [0, half, 1, half+1, ...].
+/// scratch must be at least head_dim*n_cols elements (one head's worth).
+fn permuteQKInPlace(buf: []f32, n_heads: u32, n_cols: usize, scratch: []f32) void {
+    const n_rows = buf.len / n_cols;
+    const head_dim = n_rows / @as(usize, n_heads);
+    const half = head_dim / 2;
+    for (0..@as(usize, n_heads)) |h| {
+        const head_start = h * head_dim * n_cols;
+        const head_rows = buf[head_start..][0 .. head_dim * n_cols];
+        @memcpy(scratch[0..head_dim * n_cols], head_rows);
+        for (0..half) |i| {
+            @memcpy(buf[head_start + (2 * i) * n_cols ..][0..n_cols], scratch[i * n_cols ..][0..n_cols]);
+            @memcpy(buf[head_start + (2 * i + 1) * n_cols ..][0..n_cols], scratch[(half + i) * n_cols ..][0..n_cols]);
+        }
+    }
+}
+
 pub fn prepare_tensorsV3(
     allocator: std.mem.Allocator,
     metadata: *Metadata,
+    arch: ModelArch,
     safetensors_buffer: []const u8,
     writer: *GGUFWriter,
     out_file: *std.fs.File,
+    qtype: QuantType,
 ) !void {
     const alignment: u64 = 32;
 
@@ -58,7 +127,10 @@ pub fn prepare_tensorsV3(
     };
     const block_count: u32 = block_count_val.u32;
 
-    var tensor_map = try getTensorNameMap(allocator, ModelArch.GEMMA3, block_count);
+    const n_head: u32 = if (metadata.get(allocator, "attention.head_count")) |v| v.u32 else 1;
+    const n_kv_head: u32 = if (metadata.get(allocator, "attention.head_count_kv")) |v| v.u32 else n_head;
+
+    var tensor_map = try getTensorNameMap(allocator, arch, block_count);
     const offkeys = try metadata.offsetKeys(allocator);
 
     const OffsetPatch = struct {
@@ -66,6 +138,7 @@ pub fn prepare_tensorsV3(
         pos_in_file: usize,
         tensor_info: *const TensorInfo,
         name: []const u8,
+        actual_dtype: []const u8,
     };
     var offset_patch_list: std.ArrayList(OffsetPatch) = .empty;
     defer offset_patch_list.deinit(allocator);
@@ -92,12 +165,18 @@ pub fn prepare_tensorsV3(
             try writer.writeU64(dim);
         }
 
-        var out_dtype: []const u8 = "F16";
-        if (std.mem.endsWith(u8, new_name.?, "_norm.weight")) {
-            out_dtype = "F32"; // override header dtype for norms
-        }
+        const is_norm_header = std.mem.endsWith(u8, new_name.?, "_norm.weight");
+        // For Q4_K, the innermost dimension (shape_to_write[0]) must be a multiple
+        // of 256. When it isn't, fall back to Q8_0 for that tensor so llama.cpp
+        // doesn't reject it at load time.
+        const row_dim = if (shape_to_write.len > 0) shape_to_write[0] else 1;
+        const actual_dtype: []const u8 = if (is_norm_header) "F32" else switch (qtype) {
+            .f16  => "F16",
+            .q8_0 => "Q8_0",
+            .q4_k => if (row_dim % 256 == 0) "Q4_K" else "Q8_0",
+        };
 
-        const kind = @as(u32, @intCast(@intFromEnum(try mapDtypeToGGML(out_dtype))));
+        const kind = @as(u32, @intCast(@intFromEnum(try mapDtypeToGGML(actual_dtype))));
         try writer.writeU32(kind);
 
         const offset_placeholder_pos = writer.position;
@@ -108,6 +187,7 @@ pub fn prepare_tensorsV3(
             .pos_in_file = offset_placeholder_pos,
             .tensor_info = tensor,
             .name = new_name.?,
+            .actual_dtype = actual_dtype,
         });
     }
 
@@ -135,41 +215,141 @@ pub fn prepare_tensorsV3(
         const count = tensor_data.len / type_size;
 
         if (is_norm) {
-            // Convert norms to F32
+            // Gemma stores RMSNorm weights as (γ - 1); all other architectures
+            // (LLaMA, Qwen2, …) store γ directly.  Only add the offset for Gemma.
+            const norm_offset: f32 = switch (arch) {
+                .GEMMA, .GEMMA2, .GEMMA3 => 1.0,
+                else => 0.0,
+            };
+
             var buf = try allocator.alloc(f32, count);
             defer allocator.free(buf);
 
-            var i: usize = 0;
-            while (i < count) : (i += 1) {
+            for (0..count) |i| {
                 buf[i] = switch (tensor_type) {
-                    .TensorTypeF32 => @as(f32, @bitCast(readU32LE(tensor_data[i * 4 ..][0..4]))),
-                    .TensorTypeF16 => quant.halfToF32(readU16LE(tensor_data[i * 2 ..][0..2])),
-                    .TensorTypeBF16 => bf16ToF32(readU16LE(tensor_data[i * 2 ..][0..2])),
+                    .TensorTypeF32  => @as(f32, @bitCast(readU32LE(tensor_data[i * 4 ..][0..4]))) + norm_offset,
+                    .TensorTypeF16  => quant.halfToF32(readU16LE(tensor_data[i * 2 ..][0..2])) + norm_offset,
+                    .TensorTypeBF16 => bf16ToF32(readU16LE(tensor_data[i * 2 ..][0..2])) + norm_offset,
                     else => return error.UnsupportedDtype,
-                } + 1.0;
+                };
             }
 
             try writer.writer.writeAll(@as([*]const u8, @ptrCast(buf.ptr))[0 .. count * @sizeOf(f32)]);
             writer.advance(count * @sizeOf(f32));
-        } else switch (tensor_type) {
-            .TensorTypeBF16 => {
-                // Downcast to F16
-                var buf = try allocator.alloc(u16, count);
-                defer allocator.free(buf);
-                var i: usize = 0;
-                while (i < count) : (i += 1) {
-                    const bf_bits = readU16LE(tensor_data[i * 2 ..][0..2]);
-                    buf[i] = bf16ToF16(bf_bits);
+        } else {
+            const is_q = std.mem.endsWith(u8, patch.name, ".attn_q.weight");
+            const is_k = std.mem.endsWith(u8, patch.name, ".attn_k.weight");
+            // Only LLaMA-family models use the NeoX-style blocked RoPE that
+            // requires this head-interleave permutation.  Gemma uses a different
+            // RoPE convention and must NOT be permuted.
+            const needs_permute = (is_q or is_k) and switch (arch) {
+                .LLAMA, .QWEN2, .QWEN2VL, .QWEN2MOE, .QWEN => true,
+                else => false,
+            };
+            const perm_heads: u32 = if (is_q) n_head else n_kv_head;
+
+            // Use the dtype that was actually written to the header (which may
+            // differ from qtype when a Q4_K fallback to Q8_0 was triggered).
+            const effective_dtype = try mapDtypeToGGML(patch.actual_dtype);
+
+            if (needs_permute) {
+                // Decode to f32, permute rows for NeoX RoPE head interleaving, re-encode.
+                // After the header loop, the shape dims are already swapped in-place
+                // (shape[0]=original_cols=n_embd, shape[1]=original_rows=heads*head_dim).
+                const n_cols: usize = if (tensor.shape.len >= 2) @as(usize, tensor.shape[0]) else 1;
+                const n_rows = count / n_cols;
+                const head_dim = n_rows / @as(usize, perm_heads);
+                var f32_buf = try allocator.alloc(f32, count);
+                defer allocator.free(f32_buf);
+                for (0..count) |i| {
+                    f32_buf[i] = switch (tensor_type) {
+                        .TensorTypeF32  => @as(f32, @bitCast(readU32LE(tensor_data[i * 4 ..][0..4]))),
+                        .TensorTypeF16  => quant.halfToF32(readU16LE(tensor_data[i * 2 ..][0..2])),
+                        .TensorTypeBF16 => bf16ToF32(readU16LE(tensor_data[i * 2 ..][0..2])),
+                        else => return error.UnsupportedDtype,
+                    };
                 }
-                try writer.writer.writeAll(@as([*]const u8, @ptrCast(buf.ptr))[0 .. count * 2]);
-                writer.advance(count * 2);
-            },
-            .TensorTypeF16, .TensorTypeF32 => {
-                // Write raw bytes
-                try writer.writer.writeAll(tensor_data);
-                writer.advance(tensor_data.len);
-            },
-            else => return error.UnsupportedDtype,
+                // Permute in-place using a scratch buffer sized for one head's rows.
+                const scratch = try allocator.alloc(f32, head_dim * n_cols);
+                defer allocator.free(scratch);
+                permuteQKInPlace(f32_buf, perm_heads, n_cols, scratch);
+
+                switch (effective_dtype) {
+                    .TensorTypeF16 => {
+                        var f16_buf = try allocator.alloc(u16, count);
+                        defer allocator.free(f16_buf);
+                        for (0..count) |i| {
+                            f16_buf[i] = @bitCast(@as(f16, @floatCast(f32_buf[i])));
+                        }
+                        try writer.writer.writeAll(@as([*]const u8, @ptrCast(f16_buf.ptr))[0 .. count * 2]);
+                        writer.advance(count * 2);
+                    },
+                    .TensorTypeQ8_0 => {
+                        std.debug.assert(count % 32 == 0);
+                        const q_buf = try quant.quantizeTensorQ8_0(allocator, f32_buf);
+                        defer allocator.free(q_buf);
+                        try writer.writer.writeAll(q_buf);
+                        writer.advance(q_buf.len);
+                    },
+                    .TensorTypeQ4_K => {
+                        std.debug.assert(count % 256 == 0);
+                        const q_buf = try quant.quantizeTensorQ4K(allocator, f32_buf);
+                        defer allocator.free(q_buf);
+                        try writer.writer.writeAll(q_buf);
+                        writer.advance(q_buf.len);
+                    },
+                    else => return error.UnsupportedDtype,
+                }
+            } else {
+                switch (effective_dtype) {
+                    .TensorTypeF16 => switch (tensor_type) {
+                        .TensorTypeBF16 => {
+                            var buf = try allocator.alloc(u16, count);
+                            defer allocator.free(buf);
+                            for (0..count) |i| {
+                                buf[i] = bf16ToF16(readU16LE(tensor_data[i * 2 ..][0..2]));
+                            }
+                            try writer.writer.writeAll(@as([*]const u8, @ptrCast(buf.ptr))[0 .. count * 2]);
+                            writer.advance(count * 2);
+                        },
+                        .TensorTypeF16, .TensorTypeF32 => {
+                            try writer.writer.writeAll(tensor_data);
+                            writer.advance(tensor_data.len);
+                        },
+                        else => return error.UnsupportedDtype,
+                    },
+                    .TensorTypeQ8_0, .TensorTypeQ4_K => {
+                        var f32_buf = try allocator.alloc(f32, count);
+                        defer allocator.free(f32_buf);
+
+                        for (0..count) |i| {
+                            f32_buf[i] = switch (tensor_type) {
+                                .TensorTypeF32  => @as(f32, @bitCast(readU32LE(tensor_data[i * 4 ..][0..4]))),
+                                .TensorTypeF16  => quant.halfToF32(readU16LE(tensor_data[i * 2 ..][0..2])),
+                                .TensorTypeBF16 => bf16ToF32(readU16LE(tensor_data[i * 2 ..][0..2])),
+                                else => return error.UnsupportedDtype,
+                            };
+                        }
+
+                        const q_buf = switch (effective_dtype) {
+                            .TensorTypeQ8_0 => blk: {
+                                std.debug.assert(count % 32 == 0);
+                                break :blk try quant.quantizeTensorQ8_0(allocator, f32_buf);
+                            },
+                            .TensorTypeQ4_K => blk: {
+                                std.debug.assert(count % 256 == 0);
+                                break :blk try quant.quantizeTensorQ4K(allocator, f32_buf);
+                            },
+                            else => unreachable,
+                        };
+                        defer allocator.free(q_buf);
+
+                        try writer.writer.writeAll(q_buf);
+                        writer.advance(q_buf.len);
+                    },
+                    else => return error.UnsupportedDtype,
+                }
+            }
         }
 
         // pad to alignment
@@ -432,50 +612,70 @@ fn prepare_tensors(
 pub fn convertToGGUFFromSafeTensors(
     allocator: std.mem.Allocator,
     metadata: *Metadata,
+    arch: ModelArch,
     safetensors_buffer: []const u8,
     basename: []const u8,
     architecture: []const u8,
     model_name: []const u8,
-    tokenizer_path: []const u8,
-    quant_version: u32,
+    tok: TokenizerSpec,
+    qtype: QuantType,
     out_file: *std.fs.File,
 ) !void {
     var writer = GGUFWriter.init(out_file.*);
 
-    try writeGGUFHeader(&writer, metadata);
+    try writeGGUFHeader(&writer, metadata, tok.kvCount());
+
+    var total_params: u64 = 0;
+    for (metadata.tensors.items) |tensor| {
+        var n: u64 = 1;
+        for (tensor.shape) |d| n *= d;
+        total_params += n;
+    }
 
     try writeGeneralMetadata(
         &writer,
         basename,
         architecture,
         model_name,
+        total_params,
     );
 
     try writeExtraMetadataKV(&writer, metadata);
 
-    try writeSentencePieceTokenizerVocab(
-        allocator,
-        &writer,
-        tokenizer_path,
-    );
+    switch (tok) {
+        .sentencepiece => |path| try writeSentencePieceTokenizerVocab(allocator, &writer, path),
+        .bpe => |paths| try writeBPETokenizerVocab(allocator, &writer, paths.json, paths.config),
+    }
 
     try writer.writeString("general.quantization_version");
     try writer.writeU32(4); // ggufTypeUint32
-    try writer.writeU32(quant_version);
+    try writer.writeU32(2);
 
     try prepare_tensorsV3(
         allocator,
         metadata,
+        arch,
         safetensors_buffer,
         &writer,
         out_file,
+        qtype,
     );
 }
 
-fn prepare_metadata(allocator: std.mem.Allocator, metadata: *Metadata, model: registry.ModelInfo, model_files: []const []const u8) !void {
+fn prepare_metadata(allocator: std.mem.Allocator, metadata: *Metadata, model: registry.ModelInfo, model_files: []const []const u8) !ModelArch {
+    var detected_arch: ModelArch = .LLAMA;
     if (utils.indexOfStringInList(model_files, "config.json")) |i| {
         if (try utils.tryLoadJson(allocator, model, model_files[i])) |cfg| {
             const obj = cfg.object;
+
+            // Detect architecture from model_type before any metadata.put() calls
+            // so that all KV keys get the correct prefix.
+            if (obj.get("model_type")) |v| {
+                if (v == .string) {
+                    detected_arch = archFromModelType(v.string);
+                    metadata.arch_prefix = ModelArchNames.get(detected_arch);
+                }
+            }
 
             if (obj.get("max_position_embeddings")) |v| {
                 try metadata.put(
@@ -555,7 +755,7 @@ fn prepare_metadata(allocator: std.mem.Allocator, metadata: *Metadata, model: re
             }
             try metadata.metadata.put(
                 "general.file_type",
-                .{ .u32 = (@as(u32, (@intCast(1)))) },
+                .{ .u32 = 7 }, // LLAMA_FTYPE_MOSTLY_Q8_0
             );
 
             if (obj.get("rope_theta")) |v| {
@@ -626,12 +826,12 @@ fn prepare_metadata(allocator: std.mem.Allocator, metadata: *Metadata, model: re
             }
         }
     }
+    return detected_arch;
 }
 
-pub fn convert(model_name: []const u8, output_path: []const u8, allocator: std.mem.Allocator) !void {
+pub fn convert(model_name: []const u8, output_path: []const u8, qtype: QuantType, allocator: std.mem.Allocator) !void {
     const fs = std.fs;
 
-    // Open and read the safetensors input file
     const model = try registry.findModelErrorless(model_name);
     const found_model = model.?;
     const model_files = found_model.files;
@@ -641,9 +841,16 @@ pub fn convert(model_name: []const u8, output_path: []const u8, allocator: std.m
     const buffer = try found_model.loadSafetensorsBuffer(allocator);
     defer allocator.free(buffer);
 
-    // Parse safetensors metadata
     var metadata = try parseSafetensorsFromBuffer(allocator, model_name, buffer);
-    try prepare_metadata(allocator, &metadata, found_model, model_files);
+    const model_arch = try prepare_metadata(allocator, &metadata, found_model, model_files);
+    const arch_str = ModelArchNames.get(model_arch);
+
+    // Override file_type based on selected quant
+    try metadata.metadata.put("general.file_type", .{ .u32 = switch (qtype) {
+        .f16  => 1,
+        .q8_0 => 7,
+        .q4_k => 12, // LLAMA_FTYPE_MOSTLY_Q4_K_S
+    }});
 
     var output_file = try fs.cwd().createFile(
         output_path,
@@ -651,19 +858,34 @@ pub fn convert(model_name: []const u8, output_path: []const u8, allocator: std.m
     );
     defer output_file.close();
 
-    // Convert to GGUF and write to file
-    const tokenizer_path = try found_model.localFilePath(found_model.name, "tokenizer_export.json");
+    const tok: TokenizerSpec = blk: {
+        const sp_path = try found_model.localFilePath(found_model.name, "tokenizer_export.json");
+        if (std.fs.cwd().access(sp_path, .{})) |_| {
+            break :blk TokenizerSpec{ .sentencepiece = sp_path };
+        } else |_| {}
+
+        const bpe_json = try found_model.localFilePath(found_model.name, "tokenizer.json");
+        std.fs.cwd().access(bpe_json, .{}) catch return error.NoTokenizerFound;
+        const bpe_cfg = try found_model.localFilePath(found_model.name, "tokenizer_config.json");
+        break :blk TokenizerSpec{ .bpe = .{ .json = bpe_json, .config = bpe_cfg } };
+    };
+
     try convertToGGUFFromSafeTensors(
         allocator,
         &metadata,
+        model_arch,
         buffer,
         found_model.name,
+        arch_str,
         found_model.name,
-        found_model.name,
-        tokenizer_path,
-        2,
+        tok,
+        qtype,
         &output_file,
     );
 
-    std.debug.print("✓ Converted '{s}' → '{s}'\n with metadata count: {d}", .{ model_name, output_path, metadata.metadata.count() });
+    std.debug.print("✓ Converted '{s}' → '{s}' ({s})\n", .{
+        model_name,
+        output_path,
+        @tagName(qtype),
+    });
 }

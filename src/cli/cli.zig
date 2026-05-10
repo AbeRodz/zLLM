@@ -76,14 +76,64 @@ fn readSafeTensors(args: *std.process.ArgIterator, allocator: std.mem.Allocator)
     try safetensors.read(model_name, allocator);
 }
 fn convertSafeTensors(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
-    const model_name = args.next() orelse return error.InvalidUsage;
-    try converter.convert(model_name, "./model.gguf", allocator);
+    const first = args.next() orelse return error.InvalidUsage;
+
+    var qtype: converter.QuantType = .f16;
+    var model_name: []const u8 = first;
+
+    if (std.mem.eql(u8, first, "q8") or std.mem.eql(u8, first, "q8_0")) {
+        qtype = .q8_0;
+        model_name = args.next() orelse return error.InvalidUsage;
+    } else if (std.mem.eql(u8, first, "q4k") or std.mem.eql(u8, first, "q4_k")) {
+        qtype = .q4_k;
+        model_name = args.next() orelse return error.InvalidUsage;
+    } else if (std.mem.eql(u8, first, "f16")) {
+        qtype = .f16;
+        model_name = args.next() orelse return error.InvalidUsage;
+    }
+
+    const cache_dir = try models.getCacheDir(allocator);
+    defer allocator.free(cache_dir);
+    const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}-{s}.gguf", .{ cache_dir, model_name, model_name, @tagName(qtype) });
+    defer allocator.free(out_path);
+    try converter.convert(model_name, out_path, qtype, allocator);
 }
 
 fn ggufInfo(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
-    const model_name = args.next() orelse return error.InvalidUsage;
+    const first = args.next() orelse return error.InvalidUsage;
 
-    try ggufType.describe(model_name, allocator);
+    var qtype: converter.QuantType = .f16;
+    var model_name: []const u8 = first;
+
+    if (std.mem.eql(u8, first, "q8") or std.mem.eql(u8, first, "q8_0")) {
+        qtype = .q8_0;
+        model_name = args.next() orelse return error.InvalidUsage;
+    } else if (std.mem.eql(u8, first, "q4k") or std.mem.eql(u8, first, "q4_k")) {
+        qtype = .q4_k;
+        model_name = args.next() orelse return error.InvalidUsage;
+    } else if (std.mem.eql(u8, first, "f16")) {
+        qtype = .f16;
+        model_name = args.next() orelse return error.InvalidUsage;
+    }
+
+    const modelInfo = (try models.findModelErrorless(model_name)) orelse {
+        std.debug.print("Unknown model: {s}\n", .{model_name});
+        return error.UnknownModel;
+    };
+
+    // Pre-bundled .gguf in registry — quant arg is irrelevant, use it directly.
+    for (modelInfo.files) |file| {
+        if (std.mem.endsWith(u8, file, ".gguf")) {
+            const path = try modelInfo.localFilePath(modelInfo.name, file);
+            return ggufType.describePath(path, allocator);
+        }
+    }
+
+    // Converted model — resolve quant-specific filename.
+    const filename = try std.fmt.allocPrint(allocator, "{s}-{s}.gguf", .{ model_name, @tagName(qtype) });
+    defer allocator.free(filename);
+    const path = try modelInfo.localFilePath(modelInfo.name, filename);
+    try ggufType.describePath(path, allocator);
 }
 
 fn convert(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
@@ -114,17 +164,32 @@ fn convert(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
 }
 
 fn run(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
-    const model_name = args.next() orelse return error.InvalidUsage;
+    const first = args.next() orelse return error.InvalidUsage;
+
+    var qtype: converter.QuantType = .f16;
+    var model_name: []const u8 = first;
+
+    if (std.mem.eql(u8, first, "q8") or std.mem.eql(u8, first, "q8_0")) {
+        qtype = .q8_0;
+        model_name = args.next() orelse return error.InvalidUsage;
+    } else if (std.mem.eql(u8, first, "q4k") or std.mem.eql(u8, first, "q4_k")) {
+        qtype = .q4_k;
+        model_name = args.next() orelse return error.InvalidUsage;
+    } else if (std.mem.eql(u8, first, "f16")) {
+        qtype = .f16;
+        model_name = args.next() orelse return error.InvalidUsage;
+    }
+
     const prompt = args.next(); // optional — null means interactive stdin loop
     const n_ctx = 8192;
 
     if (prompt) |p| {
-        llama.execute_prompt(model_name, p, n_ctx, allocator) catch |err| {
+        llama.execute_prompt(model_name, qtype, p, n_ctx, allocator) catch |err| {
             std.debug.print("Error during execution: {}\n", .{err});
             return err;
         };
     } else {
-        llama.execute(model_name, n_ctx, allocator) catch |err| {
+        llama.execute(model_name, qtype, n_ctx, allocator) catch |err| {
             std.debug.print("Error during execution: {}\n", .{err});
             return err;
         };
@@ -132,7 +197,22 @@ fn run(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
 }
 
 fn runlookahead(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
-    const model_name = args.next() orelse return error.InvalidUsage;
+    const first = args.next() orelse return error.InvalidUsage;
+
+    var qtype: converter.QuantType = .f16;
+    var model_name: []const u8 = first;
+
+    if (std.mem.eql(u8, first, "q8") or std.mem.eql(u8, first, "q8_0")) {
+        qtype = .q8_0;
+        model_name = args.next() orelse return error.InvalidUsage;
+    } else if (std.mem.eql(u8, first, "q4k") or std.mem.eql(u8, first, "q4_k")) {
+        qtype = .q4_k;
+        model_name = args.next() orelse return error.InvalidUsage;
+    } else if (std.mem.eql(u8, first, "f16")) {
+        qtype = .f16;
+        model_name = args.next() orelse return error.InvalidUsage;
+    }
+
     const prompt = args.next() orelse "Once upon a time";
 
     const modelInfo = (try models.findModelErrorless(model_name)) orelse {
@@ -140,14 +220,17 @@ fn runlookahead(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !v
         return error.UnknownModel;
     };
 
-    // Prefer an already-converted .gguf; fall back to the default path.
-    var gguf_path: []const u8 = try modelInfo.localFilePath(modelInfo.name, "model.gguf");
-    for (modelInfo.files) |file| {
-        if (std.mem.endsWith(u8, file, ".gguf")) {
-            gguf_path = try modelInfo.localFilePath(modelInfo.name, file);
-            break;
+    // Pre-bundled .gguf in registry takes priority; otherwise use quant-specific path.
+    const gguf_path: []const u8 = blk: {
+        for (modelInfo.files) |file| {
+            if (std.mem.endsWith(u8, file, ".gguf")) {
+                break :blk try modelInfo.localFilePath(modelInfo.name, file);
+            }
         }
-    }
+        const filename = try std.fmt.allocPrint(allocator, "{s}-{s}.gguf", .{ model_name, @tagName(qtype) });
+        defer allocator.free(filename);
+        break :blk try modelInfo.localFilePath(modelInfo.name, filename);
+    };
 
     look(gguf_path, prompt, allocator) catch |err| {
         std.debug.print("Error during lookahead execution: {}\n", .{err});
@@ -259,19 +342,29 @@ fn getOptionalThreadArg(args: *std.process.ArgIterator) !?usize {
 fn printUsage() void {
     std.debug.print(
         \\Usage:
-        \\  zig build run -- <command> <model-name> [threads]
+        \\  zig build run -- <command> [options] <model-name>
         \\
         \\Commands:
-        \\  get                 Downloads a model from HuggingFace
-        \\  convert             Converts a downloaded model to GGUF
-        \\  read                Reads, displays and validates a GGUF model info
-        \\  read-safetensors    Reads, displays and validates a Safetensors model info
-        \\  serve               Serves http server 
-        \\  help                Show this message
+        \\  get                         Downloads a model from HuggingFace
+        \\  convert                     Converts a downloaded model to GGUF
+        \\  convert-safetensors         Converts safetensors → GGUF (F16 by default)
+        \\  convert-safetensors q8      Converts safetensors → GGUF (Q8_0)
+        \\  read                        Reads, displays and validates a GGUF model info
+        \\  read-safetensors            Reads, displays and validates a Safetensors model info
+        \\  serve                       Serves http server
+        \\  help                        Show this message
+        \\
+        \\Quantization options for convert-safetensors / run / run-lookahead / describe:
+        \\  f16    16-bit float (default, no quality loss)
+        \\  q8     8-bit quantized (~2x smaller than F16, near-lossless)
+        \\  q4k    4-bit K-quant (~4x smaller than F16, excellent quality)
         \\
         \\Examples:
         \\  zig build run -- get gemma3
-        \\  zig build run -- convert gemma3
+        \\  zig build run -- convert-safetensors gemma3
+        \\  zig build run -- convert-safetensors q8 gemma3
+        \\  zig build run -- convert-safetensors q4k gemma3
+        \\  zig build run -- run q4k gemma3 "write a Rust scheduler"
         \\  zig build run -- serve
         \\
     , .{});

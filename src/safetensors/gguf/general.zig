@@ -1,6 +1,7 @@
 const std = @import("std");
 const GGUFWriter = @import("../../ggml/writer.zig").GGUFWriter;
 const parseTokenizerJson = @import("../../ggml/tokenizer.zig").parseTokenizerJsonV2;
+const parseBPETokenizerJson = @import("../../ggml/tokenizer.zig").parseBPETokenizerJson;
 
 pub fn modelWeightCountRoundedNotation(
     comptime min_digits: usize,
@@ -24,15 +25,17 @@ pub fn modelWeightCountRoundedNotation(
         scale_suffix = "K";
     }
 
-    const rounded = @round(scaled_model_params);
-
-    var temp: [32]u8 = undefined;
-    const rounded_str = try std.fmt.bufPrint(&temp, "{d}", .{rounded});
-    const trimmed = std.mem.trimLeft(u8, rounded_str, "0");
-
-    const fix: usize = if (trimmed.len >= min_digits) 0 else min_digits - trimmed.len;
-
-    return std.fmt.bufPrint(buf, "{any}{d}{s}", .{ scaled_model_params, fix, scale_suffix });
+    _ = min_digits;
+    var rounded: u64 = @intFromFloat(@round(scaled_model_params));
+    // Re-bucket if rounding pushes us to the next tier (e.g. 1000M → 1B).
+    if (std.mem.eql(u8, scale_suffix, "M") and rounded >= 1000) {
+        rounded = @intFromFloat(@round(scaled_model_params / 1000.0));
+        scale_suffix = "B";
+    } else if (std.mem.eql(u8, scale_suffix, "B") and rounded >= 1000) {
+        rounded = @intFromFloat(@round(scaled_model_params / 1000.0));
+        scale_suffix = "T";
+    }
+    return std.fmt.bufPrint(buf, "{d}{s}", .{ rounded, scale_suffix });
 }
 
 pub fn sizeLabel(
@@ -163,25 +166,88 @@ pub fn writeSentencePieceTokenizerVocab(allocator: std.mem.Allocator, writer: *G
     std.debug.print("Tokenizer vocab set with {d} tokens\n", .{pieces.len});
 }
 
+/// Write exactly 9 tokenizer KV entries for a HuggingFace BPE model.
+/// Reads both tokenizer.json and tokenizer_config.json from the model directory.
+pub fn writeBPETokenizerVocab(
+    allocator: std.mem.Allocator,
+    writer: *GGUFWriter,
+    tokenizer_json_path: []const u8,
+    tokenizer_config_path: []const u8,
+) !void {
+    var data = try parseBPETokenizerJson(allocator, tokenizer_json_path, tokenizer_config_path);
+    defer data.deinit();
+
+    // 1. tokenizer.ggml.model = "gpt2"
+    try writer.writeString("tokenizer.ggml.model");
+    try writer.writeU32(8);
+    try writer.writeString("gpt2");
+
+    // 2. tokenizer.ggml.tokens
+    try writer.writeString("tokenizer.ggml.tokens");
+    try writer.writeU32(9);
+    try writer.writeU32(8);
+    try writer.writeU64(@as(u64, data.tokens.len));
+    for (data.tokens) |tok| try writer.writeString(tok);
+
+    // 3. tokenizer.ggml.token_type
+    try writer.writeString("tokenizer.ggml.token_type");
+    try writer.writeU32(9);
+    try writer.writeU32(5); // int32
+    try writer.writeU64(@as(u64, data.token_types.len));
+    for (data.token_types) |tt| try writer.writeU32(tt);
+
+    // 4. tokenizer.ggml.merges
+    try writer.writeString("tokenizer.ggml.merges");
+    try writer.writeU32(9);
+    try writer.writeU32(8);
+    try writer.writeU64(@as(u64, data.merges.len));
+    for (data.merges) |m| try writer.writeString(m);
+
+    // 5. tokenizer.ggml.bos_token_id
+    try writer.writeString("tokenizer.ggml.bos_token_id");
+    try writer.writeU32(4);
+    try writer.writeU32(data.bos_token_id);
+
+    // 6. tokenizer.ggml.eos_token_id
+    try writer.writeString("tokenizer.ggml.eos_token_id");
+    try writer.writeU32(4);
+    try writer.writeU32(data.eos_token_id);
+
+    // 7. tokenizer.ggml.unknown_token_id
+    try writer.writeString("tokenizer.ggml.unknown_token_id");
+    try writer.writeU32(4);
+    try writer.writeU32(data.unk_token_id);
+
+    // 8. tokenizer.ggml.padding_token_id
+    try writer.writeString("tokenizer.ggml.padding_token_id");
+    try writer.writeU32(4);
+    try writer.writeU32(data.pad_token_id);
+
+    // 9. tokenizer.chat_template
+    try writer.writeString("tokenizer.chat_template");
+    try writer.writeU32(8);
+    try writer.writeString(data.chat_template);
+
+    std.debug.print("BPE vocab: {d} tokens, {d} merges, bos={d} eos={d}\n", .{
+        data.tokens.len, data.merges.len, data.bos_token_id, data.eos_token_id,
+    });
+}
+
 pub fn writeGeneralMetadata(
     writer: *GGUFWriter,
     basename: []const u8,
     architecture: []const u8,
     model_name: []const u8,
-    //quant_version: u32,
+    total_params: u64,
 ) !void {
     var output: [64]u8 = undefined;
-    // TODO Get real parameters count dynamically
-    const label = try sizeLabel(2, 1_000_000_000, 0, 0, 0, &output);
-    std.debug.print("Label: {s}\n", .{label});
-    _ = model_name;
+    const label = try sizeLabel(2, total_params, 0, 0, 0, &output);
     _ = basename;
     const general_tags = .{
         .{ "general.architecture", GeneralTag{ .str = architecture } },
         .{ "general.type", GeneralTag{ .str = "model" } },
-        .{ "general.name", GeneralTag{ .str = "Gemma3" } }, // change
-        //.{ "general.basename", GeneralTag{ .str = "gemma-3" } },
-        .{ "general.size_label", GeneralTag{ .str = "1000M" } }, // should be 1B
+        .{ "general.name", GeneralTag{ .str = model_name } },
+        .{ "general.size_label", GeneralTag{ .str = label } },
         //.{ "general.file_type", GeneralTag{ .u32 = 1 } },
         //.{ "general.quantization_version", GeneralTag{ .u32 = quant_version } },
     };

@@ -283,3 +283,149 @@ fn cmpById(_: void, a: TokenArray, b: TokenArray) bool {
         return false;
     }
 }
+
+// ---------------------------------------------------------------------------
+// HuggingFace BPE tokenizer (tokenizer.json + tokenizer_config.json)
+// ---------------------------------------------------------------------------
+
+pub const BPETokenizerData = struct {
+    tokens: []const []const u8,
+    token_types: []u32,
+    merges: []const []const u8,
+    bos_token_id: u32,
+    eos_token_id: u32,
+    unk_token_id: u32,
+    pad_token_id: u32,
+    chat_template: []const u8,
+    arena: std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *BPETokenizerData) void {
+        self.arena.deinit();
+    }
+};
+
+/// Extract the token string from a tokenizer_config.json special-token field.
+/// The field can be a plain string or an object with a "content" key.
+fn extractTokenStr(v: json.Value) []const u8 {
+    return switch (v) {
+        .string => v.string,
+        .object => if (v.object.get("content")) |c|
+            (if (c == .string) c.string else "")
+        else
+            "",
+        else => "",
+    };
+}
+
+fn lookupTokenId(tokens: []const []const u8, needle: []const u8) u32 {
+    for (tokens, 0..) |tok, i| {
+        if (std.mem.eql(u8, tok, needle)) return @as(u32, @intCast(i));
+    }
+    return 0;
+}
+
+/// Parse a HuggingFace BPE tokenizer.json + tokenizer_config.json pair.
+/// All memory lives in the embedded arena; call data.deinit() to free.
+pub fn parseBPETokenizerJson(
+    backing_allocator: std.mem.Allocator,
+    tokenizer_json_path: []const u8,
+    tokenizer_config_path: []const u8,
+) !BPETokenizerData {
+    var arena = std.heap.ArenaAllocator.init(backing_allocator);
+    errdefer arena.deinit();
+    const alloc = arena.allocator();
+
+    // ── tokenizer.json ────────────────────────────────────────────────────
+    const tj = blk: {
+        var f = try std.fs.cwd().openFile(tokenizer_json_path, .{});
+        defer f.close();
+        const sz = (try f.stat()).size;
+        const buf = try alloc.alloc(u8, sz);
+        _ = try f.readAll(buf);
+        break :blk try json.parseFromSliceLeaky(json.Value, alloc, buf, .{ .allocate = .alloc_always });
+    };
+    if (tj != .object) return error.InvalidJson;
+    const tj_obj = tj.object;
+
+    const model_val = tj_obj.get("model") orelse return error.MissingModel;
+    if (model_val != .object) return error.InvalidModel;
+    const model_obj = model_val.object;
+
+    // vocab: {"token_str": id}  →  sorted [][]const u8
+    const vocab_val = model_obj.get("vocab") orelse return error.MissingVocab;
+    if (vocab_val != .object) return error.InvalidVocab;
+
+    var vocab_size: usize = 0;
+    {
+        var it = vocab_val.object.iterator();
+        while (it.next()) |e| {
+            const id = @as(usize, @intCast(e.value_ptr.*.integer));
+            if (id + 1 > vocab_size) vocab_size = id + 1;
+        }
+    }
+
+    const tokens = try alloc.alloc([]const u8, vocab_size);
+    for (tokens) |*t| t.* = "";
+    const token_types = try alloc.alloc(u32, vocab_size);
+    @memset(token_types, 1); // NORMAL
+
+    {
+        var it = vocab_val.object.iterator();
+        while (it.next()) |e| {
+            const id = @as(usize, @intCast(e.value_ptr.*.integer));
+            tokens[id] = e.key_ptr.*;
+        }
+    }
+
+    // Mark added_tokens (special=true) as CONTROL (3)
+    if (tj_obj.get("added_tokens")) |added_val| {
+        if (added_val == .array) {
+            for (added_val.array.items) |item| {
+                if (item != .object) continue;
+                const id_val = item.object.get("id") orelse continue;
+                const spec_val = item.object.get("special") orelse continue;
+                if (spec_val == .bool and spec_val.bool) {
+                    const id = @as(usize, @intCast(id_val.integer));
+                    if (id < vocab_size) token_types[id] = 3; // CONTROL
+                }
+            }
+        }
+    }
+
+    // merges: ["Ġ t", ...]
+    const merges_val = model_obj.get("merges") orelse return error.MissingMerges;
+    if (merges_val != .array) return error.InvalidMerges;
+    const merges = try alloc.alloc([]const u8, merges_val.array.items.len);
+    for (merges_val.array.items, 0..) |m, i| {
+        merges[i] = if (m == .string) m.string else "";
+    }
+
+    // ── tokenizer_config.json ─────────────────────────────────────────────
+    const tc = blk: {
+        var f = try std.fs.cwd().openFile(tokenizer_config_path, .{});
+        defer f.close();
+        const sz = (try f.stat()).size;
+        const buf = try alloc.alloc(u8, sz);
+        _ = try f.readAll(buf);
+        break :blk try json.parseFromSliceLeaky(json.Value, alloc, buf, .{ .allocate = .alloc_always });
+    };
+    const tc_obj = if (tc == .object) tc.object else return error.InvalidTokenizerConfig;
+
+    const bos_str = if (tc_obj.get("bos_token")) |v| extractTokenStr(v) else "";
+    const eos_str = if (tc_obj.get("eos_token")) |v| extractTokenStr(v) else "";
+    const unk_str = if (tc_obj.get("unk_token")) |v| extractTokenStr(v) else "";
+    const pad_str = if (tc_obj.get("pad_token")) |v| extractTokenStr(v) else "";
+    const chat_tmpl = if (tc_obj.get("chat_template")) |v| (if (v == .string) v.string else "") else "";
+
+    return BPETokenizerData{
+        .tokens = tokens,
+        .token_types = token_types,
+        .merges = merges,
+        .bos_token_id = lookupTokenId(tokens, bos_str),
+        .eos_token_id = lookupTokenId(tokens, eos_str),
+        .unk_token_id = lookupTokenId(tokens, unk_str),
+        .pad_token_id = lookupTokenId(tokens, pad_str),
+        .chat_template = chat_tmpl,
+        .arena = arena,
+    };
+}
