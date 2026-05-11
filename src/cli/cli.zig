@@ -215,6 +215,23 @@ fn runlookahead(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !v
 
     const prompt = args.next() orelse "Once upon a time";
 
+    // Optional lookahead hyperparameters — defaults match the paper's suggestion.
+    var W: usize = 7;
+    var N: usize = 5;
+    var G: usize = 7;
+    var temp: f32 = 0.8;
+    while (args.next()) |flag| {
+        if (std.mem.eql(u8, flag, "--W")) {
+            W = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidUsage, 10);
+        } else if (std.mem.eql(u8, flag, "--N")) {
+            N = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidUsage, 10);
+        } else if (std.mem.eql(u8, flag, "--G")) {
+            G = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidUsage, 10);
+        } else if (std.mem.eql(u8, flag, "--temp")) {
+            temp = try std.fmt.parseFloat(f32, args.next() orelse return error.InvalidUsage);
+        }
+    }
+
     const modelInfo = (try models.findModelErrorless(model_name)) orelse {
         std.debug.print("Unknown model: {s}\n", .{model_name});
         return error.UnknownModel;
@@ -232,7 +249,7 @@ fn runlookahead(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !v
         break :blk try modelInfo.localFilePath(modelInfo.name, filename);
     };
 
-    look(gguf_path, prompt, allocator) catch |err| {
+    look(gguf_path, prompt, W, N, G, temp, allocator) catch |err| {
         std.debug.print("Error during lookahead execution: {}\n", .{err});
         return err;
     };
@@ -365,7 +382,14 @@ fn printUsage() void {
         \\  zig build run -- convert-safetensors q8 gemma3
         \\  zig build run -- convert-safetensors q4k gemma3
         \\  zig build run -- run q4k gemma3 "write a Rust scheduler"
+        \\  zig build run -- run-lookahead gemma3 "Once upon a time"
+        \\  zig build run -- run-lookahead q4k gemma3 "hello" --W 7 --N 5 --G 7
         \\  zig build run -- serve
+        \\
+        \\Lookahead flags (all optional, defaults: W=7 N=5 G=7):
+        \\  --W <n>   window width  — parallel Jacobi sequences (higher = richer n-gram cache)
+        \\  --N <n>   n-gram depth  — lookahead levels and verification length
+        \\  --G <n>   n-gram budget — stored candidates per token
         \\
     , .{});
 }
