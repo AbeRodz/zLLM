@@ -34,11 +34,10 @@ pub fn common_token_to_piece_vocab(
     token: llama.llama_token,
     special: bool,
 ) ![]const u8 {
-    // Allocate a buffer for the string — caller owns this memory.
     var piece = try allocator.alloc(u8, 256);
+    errdefer allocator.free(piece);
 
-    // Call llama_token_to_piece
-    const n_chars = llama.llama_token_to_piece(
+    var n_chars = llama.llama_token_to_piece(
         vocab,
         token,
         @as([*c]u8, @ptrCast(&piece[0])),
@@ -48,27 +47,26 @@ pub fn common_token_to_piece_vocab(
     );
 
     if (n_chars < 0) {
-        // n_chars negative => need to resize to -n_chars
-        const new_len = @as(usize, @intCast(-n_chars));
-        std.debug.assert(new_len <= piece.len);
-
-        // Check again
-        const check = llama.llama_token_to_piece(
+        const needed: usize = @intCast(-n_chars);
+        piece = try allocator.realloc(piece, needed);
+        n_chars = llama.llama_token_to_piece(
             vocab,
             token,
             @as([*c]u8, @ptrCast(&piece[0])),
-            @as(i32, @intCast(new_len)),
+            @as(i32, @intCast(piece.len)),
             0,
             special,
         );
-        std.debug.assert(check == new_len);
-
-        return piece[0..new_len];
-    } else {
-        const new_len = @as(usize, @intCast(n_chars));
-        std.debug.assert(new_len <= piece.len);
-        return piece[0..new_len];
+        std.debug.assert(n_chars == @as(i32, @intCast(piece.len)));
+        return piece;
     }
+
+    // Shrink the allocation to the actual content length so callers can
+    // free() with the correct size. realloc(p, 0) is a valid no-op free in
+    // Zig's allocator interface and allocator.free on the returned empty
+    // slice is also a no-op, so the zero-char case is handled correctly.
+    piece = try allocator.realloc(piece, @intCast(n_chars));
+    return piece;
 }
 
 pub fn common_token_to_piece_ctx(allocator: std.mem.Allocator, ctx: *llama.llama_context, token: llama.llama_token, special: bool) ![]const u8 {

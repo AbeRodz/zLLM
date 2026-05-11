@@ -79,11 +79,7 @@ pub const NgramContainer = struct {
         self.tokens.deinit(self.allocator);
     }
 };
-pub fn look(model_path: []const u8, prompt: []const u8, allocator: std.mem.Allocator) !void {
-    const W: usize = 3;
-    const N: usize = 8;
-    const G: usize = 3;
-
+pub fn look(model_path: []const u8, prompt: []const u8, W: usize, N: usize, G: usize, temp: f32, allocator: std.mem.Allocator) !void {
     var params: common_types.CommonParams = .{};
     params.model.path = model_path;
     params.prompt = prompt;
@@ -96,6 +92,7 @@ pub fn look(model_path: []const u8, prompt: []const u8, allocator: std.mem.Alloc
     // DRY penalty scans the last n tokens on every sample call.
     // With W*(N-1) positions sampled per step this becomes O(n_ctx) per step.
     params.sampling.dry_penalty_last_n = 0;
+    params.sampling.temp = temp;
     // Skip the dummy warmup decode — saves ~1 s on cold start.
     params.warmup = false;
 
@@ -118,6 +115,12 @@ pub fn look(model_path: []const u8, prompt: []const u8, allocator: std.mem.Alloc
     // Flash attention: fused QK^T V kernel — big win on Metal / CUDA.
     params.flash_attn = false;
 
+    // Offload all layers to GPU. commonModelParamsToLlama guards on != -1, so
+    // the default of -1 would silently leave n_gpu_layers at the llama.cpp
+    // default of 0 (CPU only). Set to a large value; llama.cpp clamps it to
+    // the actual layer count.
+    params.n_gpu_layers = 999;
+
     llama.llama_backend_init();
     llama.llama_numa_init(params.numa);
 
@@ -126,13 +129,27 @@ pub fn look(model_path: []const u8, prompt: []const u8, allocator: std.mem.Alloc
     const ctx = init.context;
     const vocab = llama.llama_model_get_vocab(@ptrCast(model)).?;
 
+    // Apply the model's chat template so the model receives proper instruction-following
+    // context (e.g. <start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n).
+    // Without this the raw prompt is ambiguous and the model may ignore the language.
+    const model_tmpl = llama.llama_model_chat_template(@ptrCast(model), null);
+    const prompt_z = try allocator.dupeZ(u8, prompt);
+    defer allocator.free(prompt_z);
+    const chat_msg = llama.llama_chat_message{ .role = "user", .content = prompt_z.ptr };
+    const n_fmt = llama.llama_chat_apply_template(model_tmpl, &chat_msg, 1, true, null, 0);
+    if (n_fmt < 0) return error.ChatTemplateFailed;
+    const fmt_buf = try allocator.alloc(u8, @intCast(n_fmt + 1));
+    defer allocator.free(fmt_buf);
+    _ = llama.llama_chat_apply_template(model_tmpl, &chat_msg, 1, true, fmt_buf.ptr, @intCast(fmt_buf.len));
+    const formatted_prompt = fmt_buf[0..@intCast(n_fmt)];
+
     // -------------------------------
     // Tokenize prompt
     // -------------------------------
     var inp = try common.common_tokenize(
         allocator,
         @ptrCast(vocab),
-        params.prompt,
+        formatted_prompt,
         true,
         true,
     );
@@ -145,6 +162,7 @@ pub fn look(model_path: []const u8, prompt: []const u8, allocator: std.mem.Alloc
 
     for (inp.items) |t| {
         const piece = try common_init.common_token_to_piece_vocab(allocator, @ptrCast(vocab), t, false);
+        defer allocator.free(piece);
         std.debug.print("{s}", .{piece});
     }
     std.debug.print("\n", .{});
@@ -237,15 +255,33 @@ pub fn look(model_path: []const u8, prompt: []const u8, allocator: std.mem.Alloc
     var id = common_sampler.common_sampler_sample(allocator, sampler, @ptrCast(ctx.?), 0, false);
     common_sampler.common_sampler_accept(sampler, id, true);
 
-    std.debug.print(
-        "{s}",
-        .{try common_init.common_token_to_piece_vocab(allocator, @ptrCast(vocab), id, false)},
-    );
+    {
+        const piece = try common_init.common_token_to_piece_vocab(allocator, @ptrCast(vocab), id, false);
+        defer allocator.free(piece);
+        std.debug.print("{s}", .{piece});
+    }
 
     var n_past: i32 = @intCast(inp.items.len);
     var n_predict: i32 = 0;
     var n_accept: i32 = 0;
     var has_eos = false;
+
+    const n_vocab: usize = @intCast(llama.llama_vocab_n_tokens(vocab));
+
+    // Separate RNG for the lookahead branch — never touches the main sampler's
+    // internal state so the AR output distribution is unaffected.
+    var branch_prng = std.Random.DefaultPrng.init(
+        @truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))),
+    );
+    const branch_rng = branch_prng.random();
+
+    // Pre-allocate scratch buffers used inside the main loop.
+    const seqs_buf = try allocator.alloc(llama.llama_seq_id, W);
+    defer allocator.free(seqs_buf);
+    // ngram_buf holds a single N-1 gram during the n-gram update pass.
+    // N is a runtime value so we can't use a stack array here.
+    const ngram_buf = try allocator.alloc(llama.llama_token, N - 1);
+    defer allocator.free(ngram_buf);
 
     const t_dec_start = std.time.nanoTimestamp();
 
@@ -298,11 +334,8 @@ pub fn look(model_path: []const u8, prompt: []const u8, allocator: std.mem.Alloc
         // Lookahead levels
         // -------------------------------
         for (1..W) |i| {
-            const seqs = try allocator.alloc(llama.llama_seq_id, W - i);
-            defer allocator.free(seqs);
-
+            const seqs = seqs_buf[0 .. W - i];
             for (seqs, 0..) |*s, j| s.* = @intCast(i + j + 1);
-
             common.common_batch_add(
                 @ptrCast(&batch),
                 tokens_j[0][i],
@@ -353,6 +386,7 @@ pub fn look(model_path: []const u8, prompt: []const u8, allocator: std.mem.Alloc
 
             // Verified tokens print in cyan; the main token prints normally.
             const piece = try common_init.common_token_to_piece_vocab(allocator, @ptrCast(vocab), id, false);
+            defer allocator.free(piece);
             if (v == 0) {
                 std.debug.print("{s}", .{piece});
             } else {
@@ -386,20 +420,64 @@ pub fn look(model_path: []const u8, prompt: []const u8, allocator: std.mem.Alloc
             for (0..N - 2) |j| @memcpy(tokens_j[j], tokens_j[j + 1]);
 
             if (v == 0) {
-                // Sample new last-level tokens from the batch logits.
-                // Batch layout after position 0:
-                //   g_cur*(N-1) verification tokens, then (W-1) + (N-2)*W lookahead tokens.
-                // Last level (j = N-2 in the 1..N-1 batch loop) starts at index:
-                //   g_cur*(N-1) + (W-1) + (N-3)*W  =  g_cur*(N-1) + W*(N-2)
+                // Lookahead branch token sampling.
+                // temp=0: greedy argmax — single compare pass, no log calls.
+                // temp>0: top-K Gumbel-max.
+                //   Pass 1 — O(n_vocab) float compares: collect the K highest logits.
+                //             Fast path is 1 compare per token; log calls only happen
+                //             for the K winners (K=50 << 262 144).
+                //   Pass 2 — K Gumbel draws: argmax(logit/T − log(−log(U))).
+                //             Equivalent to sampling softmax(logits/T) exactly.
+                // Batch index of last-level slot i: g_cur*(N-1) + W*(N-2) + i
+                const K = 50;
                 const g_cur_sz: usize = @intCast(g_cur);
                 for (0..W) |i| {
-                    tokens_j[N - 2][i] = common_sampler.common_sampler_sample(
-                        allocator,
-                        sampler,
-                        @ptrCast(ctx.?),
-                        @intCast(g_cur_sz * (N - 1) + W * (N - 2) + i),
-                        false,
-                    );
+                    const logit_idx: i32 = @intCast(g_cur_sz * (N - 1) + W * (N - 2) + i);
+                    const raw_logits = llama.llama_get_logits_ith(@ptrCast(ctx.?), logit_idx);
+                    var best_id: llama.llama_token = 0;
+                    if (temp <= 0.0) {
+                        var best_logit: f32 = raw_logits[0];
+                        for (1..n_vocab) |vi| {
+                            if (raw_logits[vi] > best_logit) {
+                                best_logit = raw_logits[vi];
+                                best_id = @intCast(vi);
+                            }
+                        }
+                    } else {
+                        // Sorted-ascending buffer: top_logits[0] is the current minimum.
+                        var top_logits: [K]f32 = undefined;
+                        var top_ids: [K]llama.llama_token = undefined;
+                        for (0..K) |k| { top_logits[k] = raw_logits[k]; top_ids[k] = @intCast(k); }
+                        // Insertion-sort seed buffer (ascending).
+                        for (1..K) |k| {
+                            const kl = top_logits[k]; const ki = top_ids[k];
+                            var m = k;
+                            while (m > 0 and top_logits[m - 1] > kl) : (m -= 1) {
+                                top_logits[m] = top_logits[m - 1]; top_ids[m] = top_ids[m - 1];
+                            }
+                            top_logits[m] = kl; top_ids[m] = ki;
+                        }
+                        // Scan rest: fast-path is one compare per token.
+                        for (K..n_vocab) |vi| {
+                            const lv = raw_logits[vi];
+                            if (lv > top_logits[0]) {
+                                var lo: usize = 1; var hi: usize = K;
+                                while (lo < hi) { const mid = lo + (hi - lo) / 2; if (top_logits[mid] < lv) lo = mid + 1 else hi = mid; }
+                                const dst = lo - 1;
+                                std.mem.copyForwards(f32, top_logits[0..dst], top_logits[1..lo]);
+                                std.mem.copyForwards(llama.llama_token, top_ids[0..dst], top_ids[1..lo]);
+                                top_logits[dst] = lv; top_ids[dst] = @intCast(vi);
+                            }
+                        }
+                        // Gumbel-max over K candidates.
+                        var best_score: f32 = -std.math.inf(f32);
+                        for (0..K) |k| {
+                            const u = @max(branch_rng.float(f32), 1e-10);
+                            const score = top_logits[k] / temp - @log(-@log(u));
+                            if (score > best_score) { best_score = score; best_id = top_ids[k]; }
+                        }
+                    }
+                    tokens_j[N - 2][i] = best_id;
                 }
             } else {
                 // Verified path: re-initialize last level from the (now shifted) first level.
@@ -416,7 +494,7 @@ pub fn look(model_path: []const u8, prompt: []const u8, allocator: std.mem.Alloc
                     const ft: usize = @intCast(tokens_j_prev[f]); // key: first token of n-gram
 
                     // Build the n-gram from the shifted tokens_j.
-                    var ngram: [N - 1]llama.llama_token = undefined;
+                    const ngram = ngram_buf;
                     for (0..N - 1) |j| ngram[j] = tokens_j[j][f];
 
                     // Skip if this exact n-gram is already stored.
@@ -487,5 +565,5 @@ pub fn look(model_path: []const u8, prompt: []const u8, allocator: std.mem.Alloc
 
 test "lookahead" {
     // Requires a real model path — run manually with `zig build run -- run-lookahead <model> "<prompt>"`
-    try look("/tmp/model.gguf", "Once upon a time", std.testing.allocator);
+    try look("/tmp/model.gguf", "Once upon a time", 7, 5, 7, 0.8, std.testing.allocator);
 }
