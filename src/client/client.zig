@@ -8,7 +8,7 @@ const DownloadContext = @import("download_context.zig").DownloadContext;
 const resolveRedirects = @import("redirects.zig").resolveRedirects;
 const utils = @import("utils.zig");
 
-pub const CHUNK_SIZE = 8 * 1024 * 1024;
+pub const CHUNK_SIZE = 16 * 1024 * 1024;
 pub var NUM_THREADS: usize = 8;
 pub var MAX_RETRIES: usize = 5;
 pub const TIMEOUT_NS: u64 = 30_000_000_000; // 30s timeout
@@ -24,27 +24,36 @@ pub fn downloadChunk(ctx: *DownloadContext, url: []const u8, start: usize, end: 
     defer for (headers) |h| ctx.allocator.free(h.value); // Free individual header values
     defer ctx.allocator.free(headers);
     while (attempt < MAX_RETRIES) : (attempt += 1) {
-        var buf: [4096]u8 = undefined;
+        //var buf: [4096]u8 = undefined;
         var client = http.Client{ .allocator = ctx.allocator };
         defer client.deinit();
-        var req = try utils.do(&ctx.client, uri, .GET, headers, &buf);
+        var req = try utils.do(
+            &ctx.client,
+            uri,
+            .GET,
+            headers,
+        );
         defer req.deinit();
+        const response = req.receiveHead(&.{}) catch |err| {
+            std.debug.print("Failed to receive head for chunk {d}-{d}, attempt {d}: {}\n", .{ start, end, attempt, err });
+            continue;
+        };
 
-        if (req.response.status != .partial_content and req.response.status != .ok) {
-            std.debug.print("Chunk {d}-{d} failed, attempt {d}, HTTP {d}\n", .{ start, end, attempt, @intFromEnum(req.response.status) });
+        if (response.head.status != .partial_content and response.head.status != .ok) {
+            std.debug.print("Chunk {d}-{d} failed, attempt {d}, HTTP {d}\n", .{ start, end, attempt, @intFromEnum(response.head.status) });
             continue;
         }
 
         var file = try std.fs.cwd().openFile(file_path, .{ .mode = .read_write });
         defer file.close();
 
-        var reader = req.reader();
+        var reader = response.reader();
         var buffer: [4096]u8 = undefined;
         var offset = start;
         var total_written: usize = 0;
-
+        // this is wrong, need to read from reader
         while (true) {
-            const bytes_read = try reader.read(&buffer);
+            const bytes_read = reader.bufferedLen();
             if (bytes_read == 0) break;
 
             try file.pwriteAll(buffer[0..bytes_read], offset);
@@ -93,24 +102,36 @@ pub fn downloadChunkV3(
         if (attempt > 0) {
             const backoff_ns = 500_000_000; // Exponential backoff
             std.debug.print("Retrying chunk {d}-{d} after {d} ms\n", .{ start, end, backoff_ns / 1_000_000 });
-            std.time.sleep(backoff_ns);
+            std.Thread.sleep(backoff_ns);
         }
-        const buf = thread_allocator.alloc(u8, 4096) catch {
-            std.debug.print("Buffer alloc failed\n", .{});
-            return;
-        };
+        // const buf = thread_allocator.alloc(u8, 4096) catch {
+        //     std.debug.print("Buffer alloc failed\n", .{});
+        //     return;
+        // };
         //defer thread_allocator.free(buf);
+        var client = std.http.Client{
+            .allocator = thread_allocator,
+        };
+        defer client.deinit();
 
-        var req = ctx.do(uri, .GET, headers, buf) catch |err| {
+        var local_ctx = DownloadContext.init(thread_allocator, &client, ctx.auth_token);
+        var req = local_ctx.do(
+            uri,
+            .GET,
+            headers,
+        ) catch |err| {
             std.debug.print("Request failed (attempt {d}): {}\n", .{ attempt, err });
             continue;
         };
         defer req.deinit();
-
-        if (req.response.status != .partial_content and req.response.status != .ok) {
+        var response = req.receiveHead(&.{}) catch |err| {
+            std.debug.print("Failed to receive head for chunk {d}-{d}, attempt {d}: {}\n", .{ start, end, attempt, err });
+            continue;
+        };
+        if (response.head.status != .partial_content and response.head.status != .ok) {
             std.debug.print(
                 "Chunk {d}-{d} failed, attempt {d}, HTTP {d}\n",
-                .{ start, end, attempt, @intFromEnum(req.response.status) },
+                .{ start, end, attempt, @intFromEnum(response.head.status) },
             );
             continue;
         }
@@ -120,28 +141,36 @@ pub fn downloadChunkV3(
             return;
         };
         defer file.close();
-
-        var reader = req.reader();
+        var reader_buffer: [100]u8 = undefined;
+        var reader = response.reader(&reader_buffer);
         const buffer = thread_allocator.alloc(u8, 4096) catch {
             std.debug.print("Alloc failed for read buffer\n", .{});
             return;
         };
         //defer thread_allocator.free(buffer);
 
+        const expected_len = end - start + 1;
+        var remaining = expected_len;
         var offset = start;
 
-        while (true) {
-            const bytes_read = reader.read(buffer) catch |err| {
+        while (remaining > 0) {
+            const to_read = @min(buffer.len, remaining);
+
+            const bytes_read = reader.readSliceShort(buffer[0..to_read]) catch |err| {
                 std.debug.print("Read failed: {}\n", .{err});
                 break;
             };
+
             if (bytes_read == 0) break;
 
             file.pwriteAll(buffer[0..bytes_read], offset) catch |err| {
                 std.debug.print("Write failed: {}\n", .{err});
                 break;
             };
+
             offset += bytes_read;
+            remaining -= bytes_read;
+
             _ = ctx.download_progress.fetchAdd(bytes_read, .seq_cst);
         }
 
@@ -156,26 +185,102 @@ pub fn downloadChunkV3(
 
     std.debug.print("Chunk {d}-{d} failed after {d} attempts\n", .{ start, end, MAX_RETRIES });
 }
+pub fn downloadChunkV4(
+    ctx: *DownloadContext,
+    url: []const u8,
+    start: usize,
+    end: usize,
+    file_path: []const u8,
+) void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const uri = std.Uri.parse(url) catch return;
+
+    const headers = &[_]http.Header{
+        .{
+            .name = "Range",
+            .value = std.fmt.allocPrint(
+                allocator,
+                "bytes={d}-{d}",
+                .{ start, end },
+            ) catch return,
+        },
+    };
+
+    var attempt: usize = 0;
+
+    const expected_len = end - start + 1;
+
+    while (attempt < MAX_RETRIES) : (attempt += 1) {
+        var client = std.http.Client{
+            .allocator = allocator,
+        };
+        defer client.deinit();
+
+        var local_ctx =
+            DownloadContext.init(allocator, &client, ctx.auth_token);
+
+        var req = local_ctx.do(uri, .GET, headers) catch continue;
+        defer req.deinit();
+
+        var response = req.receiveHead(&.{}) catch continue;
+
+        if (response.head.status != .partial_content)
+            continue;
+
+        var file = std.fs.cwd().openFile(
+            file_path,
+            .{ .mode = .read_write },
+        ) catch continue;
+
+        defer file.close();
+
+        var reader_buf: [4096]u8 = undefined;
+        var reader = response.reader(&reader_buf);
+
+        var buffer: [4096]u8 = undefined;
+
+        var remaining = expected_len;
+        var offset = start;
+
+        while (remaining > 0) {
+            const to_read = @min(buffer.len, remaining);
+
+            const bytes_read =
+                reader.readSliceShort(buffer[0..to_read]) catch break;
+
+            if (bytes_read == 0) break;
+
+            file.pwriteAll(buffer[0..bytes_read], offset) catch |err| {
+                std.debug.print("Write failed: {}\n", .{err});
+                break;
+            };
+
+            offset += bytes_read;
+            remaining -= bytes_read;
+
+            _ = ctx.download_progress.fetchAdd(
+                bytes_read,
+                .seq_cst,
+            );
+        }
+
+        return;
+    }
+
+    std.debug.print(
+        "Chunk {d}-{d} failed after retries\n",
+        .{ start, end },
+    );
+}
 
 pub fn downloadConfigFile(ctx: *DownloadContext, url: []const u8, file_path: []const u8) !void {
     const uri = try std.Uri.parse(url);
 
-    const buf: []u8 = try ctx.allocator.alloc(u8, 4096);
-    defer ctx.allocator.free(buf);
-
-    var req = try ctx.do(uri, .GET, &.{}, buf);
-    defer req.deinit();
-    if (req.response.status == .unauthorized) {
-        if (ctx.auth_token == null) {
-            std.debug.print("repository requires bearer token, please add HF_TOKEN env variable and try again.", .{});
-            return error.RequiredBearerToken;
-        }
-    }
-    if (req.response.status != .ok) {
-        std.debug.print("Failed to download config: {s}, HTTP Status: {}\n", .{ file_path, req.response.status });
-        return error.DownloadFailed;
-    }
-
+    //const buf: []u8 = try ctx.allocator.alloc(u8, 4096);
+    //defer ctx.allocator.free(buf);
     var file = std.fs.cwd().createFile(file_path, .{ .exclusive = true }) catch |e|
         switch (e) {
             error.PathAlreadyExists => {
@@ -185,14 +290,38 @@ pub fn downloadConfigFile(ctx: *DownloadContext, url: []const u8, file_path: []c
             else => return e,
         };
     defer file.close();
+    var req = try ctx.do(uri, .GET, &.{});
+    var response = try req.receiveHead(&.{});
+    defer req.deinit();
+    if (response.head.status == .unauthorized) {
+        if (ctx.auth_token == null) {
+            std.debug.print("repository requires bearer token, please add HF_TOKEN env variable and try again.", .{});
+            return error.RequiredBearerToken;
+        }
+    }
+    if (response.head.status != .ok) {
+        std.debug.print("Failed to download config: {s}, HTTP Status: {}\n", .{ file_path, response.head.status });
+        return error.DownloadFailed;
+    }
 
-    var reader = req.reader();
+    var reader_buffer: [100]u8 = undefined;
+    var reader = response.reader(&reader_buffer);
     var buffer: [1024]u8 = undefined;
+    //check this change
+    const total_len = response.head.content_length orelse return error.MissingContentLength;
 
-    while (true) {
-        const bytes_read = try reader.read(&buffer);
-        if (bytes_read == 0) break;
-        _ = try file.write(buffer[0..bytes_read]);
+    var remaining = total_len;
+
+    while (remaining > 0) {
+        const to_read = @min(buffer.len, remaining);
+
+        const bytes_read = try reader.readSliceShort(buffer[0..to_read]);
+
+        if (bytes_read == 0) break; // safety
+
+        try file.writeAll(buffer[0..bytes_read]);
+
+        remaining -= bytes_read;
     }
 
     std.debug.print("Config file downloaded: {s}\n", .{file_path});
@@ -202,12 +331,12 @@ pub fn parallelDownloadV2(ctx: *DownloadContext, url: []const u8, file_path: []c
     const resolved_redirect = try resolveRedirects(ctx, url);
     const uri = try std.Uri.parse(resolved_redirect.url);
     // Get file size
-    const buf: []u8 = try ctx.allocator.alloc(u8, 8192);
+    //const buf: []u8 = try ctx.allocator.alloc(u8, 8192);
 
-    var req = try ctx.do(uri, .HEAD, &.{}, buf);
+    var req = try ctx.do(uri, .HEAD, &.{});
     defer req.deinit();
-
-    const content_length = req.response.content_length orelse return error.MissingContentLength;
+    const response = try req.receiveHead(&.{});
+    const content_length = response.head.content_length orelse return error.MissingContentLength;
     const file_size_str = progressBar.formatBytes(content_length);
     std.debug.print("📦 File size: {s}\n", .{file_size_str});
 
@@ -218,8 +347,8 @@ pub fn parallelDownloadV2(ctx: *DownloadContext, url: []const u8, file_path: []c
     const start_time = std.time.nanoTimestamp();
     const progress_thread = try Thread.spawn(.{}, progressBar.runProgressBar, .{ ctx, content_length, start_time });
     // Use dynamic thread list
-    var thread_list = std.ArrayList(Thread).init(ctx.allocator);
-    defer thread_list.deinit();
+    var thread_list: std.ArrayList(Thread) = .empty;
+    defer thread_list.deinit(ctx.allocator);
 
     const chunk_size = CHUNK_SIZE;
 
@@ -230,7 +359,7 @@ pub fn parallelDownloadV2(ctx: *DownloadContext, url: []const u8, file_path: []c
     defer arena.deinit();
     const pool_allocator = arena.allocator();
 
-    try pool.init(.{ .allocator = pool_allocator, .n_jobs = NUM_THREADS });
+    try pool.init(.{ .allocator = pool_allocator, .n_jobs = try Thread.getCpuCount() });
     defer pool.deinit();
     std.debug.print("downloading...", .{});
     var wg: std.Thread.WaitGroup = .{};
@@ -239,7 +368,7 @@ pub fn parallelDownloadV2(ctx: *DownloadContext, url: []const u8, file_path: []c
         const start = offset;
         const end = @min(start + chunk_size - 1, content_length - 1);
         std.debug.print("dispatching chunk:{d}-{d}\n", .{ start, end });
-        pool.spawnWg(&wg, downloadChunkV3, .{ ctx, resolved_redirect.url, start, end, file_path });
+        pool.spawnWg(&wg, downloadChunkV4, .{ ctx, resolved_redirect.url, start, end, file_path });
 
         offset += chunk_size;
     }
@@ -248,8 +377,9 @@ pub fn parallelDownloadV2(ctx: *DownloadContext, url: []const u8, file_path: []c
     // for (thread_list.items) |t| {
     //     t.join();
     // }
+    ctx.download_done.store(true, .seq_cst);
     progress_thread.join();
-
+    try file.sync();
     std.debug.print("Download completed: {s}\n", .{file_path});
 }
 
@@ -258,10 +388,10 @@ pub fn parallelDownload(ctx: *DownloadContext, url: []const u8, file_path: []con
     const uri = try std.Uri.parse(resolved_redirect.url);
 
     // Get content length
-    const buf = try ctx.allocator.alloc(u8, 8192);
-    defer ctx.allocator.free(buf);
+    //const buf = try ctx.allocator.alloc(u8, 8192);
+    //defer ctx.allocator.free(buf);
     const headers = try utils.buildHeaders(ctx, ctx.allocator, &[_]http.Header{});
-    var req = try utils.do(&ctx.client, uri, .HEAD, headers, buf);
+    var req = try utils.do(&ctx.client, uri, .HEAD, headers);
     defer req.deinit();
     try req.send();
     try req.wait();
@@ -277,7 +407,7 @@ pub fn parallelDownload(ctx: *DownloadContext, url: []const u8, file_path: []con
     const start_time = std.time.nanoTimestamp();
     const progress_thread = try Thread.spawn(.{}, progressBar.runProgressBar, .{ ctx, content_length, start_time });
 
-    var thread_list = std.ArrayList(Thread).init(ctx.allocator);
+    var thread_list: std.ArrayList(Thread) = .empty;
     defer thread_list.deinit();
 
     var offset: usize = 0;
@@ -291,11 +421,11 @@ pub fn parallelDownload(ctx: *DownloadContext, url: []const u8, file_path: []con
             std.debug.print("Thread spawn failed: {}\n", .{err});
             return err;
         };
-        try thread_list.append(thread);
+        try thread_list.append(ctx.allocator, thread);
 
         offset += chunk_size;
 
-        if (thread_list.items.len >= NUM_THREADS) {
+        if (thread_list.items.len >= try Thread.getCpuCount()) {
             for (thread_list.items) |t| t.join();
             thread_list.clearRetainingCapacity();
         }
@@ -315,11 +445,12 @@ pub fn downloader(model_info: ModelInfo, allocator: std.mem.Allocator) !void {
         },
         else => return err,
     };
-    var ctx = DownloadContext{
-        .allocator = std.heap.page_allocator,
-        .auth_token = token,
-        .client = std.http.Client{ .allocator = allocator },
+    var client = std.http.Client{
+        .allocator = allocator,
     };
+    defer client.deinit();
+
+    var ctx = DownloadContext.init(allocator, &client, token);
 
     std.debug.print("Downloading model: {s}\n", .{model_info.name});
     for (model_info.files) |file_name| {
@@ -342,13 +473,21 @@ pub fn downloader(model_info: ModelInfo, allocator: std.mem.Allocator) !void {
         var backoff_ns: u64 = 500_000_000;
         while (attempt < MAX_RETRIES) : (attempt += 1) {
             backoff_ns += 1_000_000_000; // Add 1s more for each config file as backoff
-
+            //try parallelDownloadV2(&ctx, full_url, file_path);
+            // const resolved_redirect = try resolveRedirects(&ctx, full_url);
+            // const uri = try std.Uri.parse(resolved_redirect.url);
+            // var req = try ctx.do(uri, .HEAD, &.{});
+            // defer req.deinit();
+            // const response = try req.receiveHead(&.{});
+            // const content_length = response.head.content_length orelse return error.MissingContentLength;
+            // const file_size_str = progressBar.formatBytes(content_length);
+            // std.debug.print("📦 File size: {s}\n", .{file_size_str});
             downloadConfigFile(&ctx, full_url, file_path) catch |e|
                 switch (e) {
                     error.PathAlreadyExists => break, // skip existing
                     else => {
-                        std.debug.print("Config download failed for {s}, attempt {d}\n", .{ file_name, attempt + 1 });
-                        std.time.sleep(backoff_ns);
+                        std.debug.print("Config download failed with error:{} for {s}, attempt {d}\n", .{ e, file_name, attempt + 1 });
+                        std.Thread.sleep(backoff_ns);
                         backoff_ns *= 2;
                         if (attempt + 1 == MAX_RETRIES) return;
                     },

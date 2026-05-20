@@ -1,16 +1,44 @@
 const std = @import("std");
 
-const finishReasonToolCalls = "tool_calls";
+// ---------------------------------------------------------------------------
+// Request-side tool types
+// ---------------------------------------------------------------------------
 
-const ToolCall = struct {
-    id: []const u8,
-    index: i32,
-    type: []const u8,
-    function: struct {
-        name: []const u8,
-        arguments: []const u8,
-    },
+/// Describes a single function the model can call.
+pub const FunctionDefinition = struct {
+    name: []const u8,
+    description: ?[]const u8 = null,
+    /// Raw JSON string of the parameters schema (null if not provided).
+    parameters: ?[]const u8 = null,
 };
+
+/// A tool entry in the request's "tools" array.
+pub const Tool = struct {
+    type: []const u8 = "function",
+    function: FunctionDefinition,
+};
+
+// ---------------------------------------------------------------------------
+// Response-side tool call type
+// (also appears in conversation history for assistant messages)
+// ---------------------------------------------------------------------------
+
+pub const ToolCallFunction = struct {
+    name: []const u8,
+    /// JSON-encoded string of the argument object, e.g. "{\"city\":\"Paris\"}".
+    arguments: []const u8,
+};
+
+pub const ToolCall = struct {
+    id: []const u8,
+    index: i32 = 0,
+    type: []const u8 = "function",
+    function: ToolCallFunction,
+};
+
+// ---------------------------------------------------------------------------
+// Error types
+// ---------------------------------------------------------------------------
 
 const Error = struct {
     message: []const u8,
@@ -22,6 +50,10 @@ const Error = struct {
 const ErrorResponse = struct {
     errorResponse: Error,
 };
+
+// ---------------------------------------------------------------------------
+// Message content types
+// ---------------------------------------------------------------------------
 
 pub const ContentPart = union(enum) {
     text: TextContentPart,
@@ -50,26 +82,45 @@ pub const FileContentPart = struct {
     // TODO
 };
 
-pub const Content = union(enum) {
-    plain: []const u8,
-    object: ContentObject,
-};
-
 pub const ContentObject = union(enum) {
     text: []const u8,
     parts: []ContentPart,
 };
 
+pub const Content = union(enum) {
+    /// Null content — used in assistant messages that only carry tool_calls.
+    none,
+    plain: []const u8,
+    object: ContentObject,
+};
+
+// ---------------------------------------------------------------------------
+// Message / response types
+// ---------------------------------------------------------------------------
+
 pub const Message = struct {
     role: []const u8,
     content: Content,
+    /// Present in assistant messages that requested tool calls.
     tool_calls: ?[]ToolCall = null,
+    /// Present in tool-role messages; identifies which call this result answers.
+    tool_call_id: ?[]const u8 = null,
 };
 
 pub const ResponseMessage = struct {
-    content: []const u8,
+    /// Null when finish_reason is "tool_calls" (only tool_calls is populated).
+    content: ?[]const u8,
     tool_calls: ?[]ToolCall = null,
     role: []const u8,
+};
+
+/// Delta payload for streaming chunks. All fields are optional so null values
+/// are omitted from JSON output when serialized with emit_null_optional_fields=false.
+/// OpenAI only sends role in the first delta; subsequent deltas omit it entirely.
+pub const StreamDelta = struct {
+    role: ?[]const u8 = null,
+    content: ?[]const u8 = null,
+    tool_calls: ?[]ToolCall = null,
 };
 
 pub const Choice = struct {
@@ -81,7 +132,7 @@ pub const Choice = struct {
 pub const ChunkChoice = struct {
     finish_reason: ?[]const u8,
     index: i32,
-    delta: ResponseMessage,
+    delta: StreamDelta,
 };
 
 pub const CompleteChunkChoice = struct {
@@ -106,13 +157,17 @@ pub const ResponseFormat = struct {
 };
 
 const EmbedRequest = struct {
-    input: type,
+    input: []const u8,
     model: []const u8,
 };
 
 pub const StreamOptions = struct {
     include_usage: bool,
 };
+
+// ---------------------------------------------------------------------------
+// Request / response top-level types
+// ---------------------------------------------------------------------------
 
 pub const ChatCompletionRequest = struct {
     model: []const u8,
@@ -127,7 +182,9 @@ pub const ChatCompletionRequest = struct {
     presence_penalty: ?f64 = null,
     top_p: ?f64 = null,
     response_format: ?ResponseFormat = null,
-    tools: ?[]ToolCall = null,
+    tools: ?[]Tool = null,
+    /// "auto" | "none" | "required" | {"type":"function","function":{"name":"..."}}
+    tool_choice: ?[]const u8 = null,
 };
 
 pub const ChatCompletionResponse = struct {
@@ -146,73 +203,8 @@ pub const ChatCompletionChunk = struct {
     created: i64,
     model: []const u8,
     system_fingerprint: []const u8,
-    object: []const u8 = "chat.completion",
-    usage: Usage,
-};
-
-pub const CompletionRequest = struct {
-    model: []const u8,
-    messages: []const u8,
-    frequency_penalty: f32,
-    max_tokens: ?i32 = null,
-    temperature: ?f32 = null,
-    presence_penalty: ?f32 = null,
-    seed: ?[]const u8,
-    stop: ?[]const u8 = null,
-    stream: ?bool = null,
-    stream_options: ?StreamOptions,
-    top_p: ?f32 = null,
-    suffix: []const u8,
-};
-
-pub const Completion = struct {
-    id: []const u8,
-    object: []const u8,
-    created: i64,
-    model: []const u8,
-    system_fingerprint: []const u8,
-    choices: []CompleteChunkChoice,
-    usage: Usage,
-};
-
-const CompletionChunk = struct {
-    id: []const u8,
-    object: []const u8,
-    created: i64,
-    model: []const u8,
-    system_fingerprint: []const u8,
-    choices: []CompleteChunkChoice,
-    usage: ?*Usage,
-};
-
-const Model = struct {
-    id: []const u8,
-    object: []const u8,
-    created: i64,
-    owned_by: []const u8,
-};
-
-const Embedding = struct {
-    object: []const u8,
-    embedding: []f32,
-    index: i32,
-};
-
-const EmbeddingUsage = struct {
-    prompt_tokens: i32,
-    total_tokens: i32,
-};
-
-const EmbeddingList = struct {
-    object: []const u8,
-    data: []Embedding,
-    model: []const u8,
-    usage: EmbeddingUsage,
-};
-
-const ListCompletion = struct {
-    object: []const u8,
-    data: []Model,
+    object: []const u8 = "chat.completion.chunk",
+    usage: ?Usage = null,
 };
 
 pub fn newError(code: i32, message: []const u8) ErrorResponse {

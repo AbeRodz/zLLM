@@ -9,7 +9,7 @@ pub const BuildContext = struct {
     path_prefix: []const u8 = "",
     build: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Mode,
+    optimize: std.builtin.OptimizeMode,
     platform: Platform,
     build_info: *CompileStep,
     lib: ?*CompileStep = null,
@@ -19,7 +19,7 @@ pub const BuildContext = struct {
         b: *std.Build,
         target: std.Build.ResolvedTarget,
         platform: Platform,
-        optimize: std.builtin.Mode,
+        optimize: std.builtin.OptimizeMode,
     ) Self {
         const zig_version = @import("builtin").zig_version_string;
         const path_prefix = b.pathJoin(&.{ thisPath(), "/llama.cpp" });
@@ -38,7 +38,7 @@ pub const BuildContext = struct {
             .target = target,
             .optimize = optimize,
             .platform = platform,
-            .build_info = b.addObject(.{ .name = "llama-build-info", .target = target, .optimize = optimize, .root_source_file = b.addWriteFiles().add(build_info_path, build_info) }),
+            .build_info = b.addObject(.{ .name = "llama-build-info", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .root_source_file = b.addWriteFiles().add(build_info_path, build_info) }) }),
         };
     }
     /// just builds everything needed and links it to your target
@@ -46,15 +46,46 @@ pub const BuildContext = struct {
         const lib = ctx.library();
         comp.linkLibrary(lib);
     }
+    pub fn linkv2(ctx: *Self, comp: *CompileStep) void {
+        if (ctx.platform == .Cuda) {
+            // External CUDA build (CMake)
+
+            comp.linkLibC();
+            comp.linkLibCpp();
+
+            comp.linkSystemLibrary("pthread");
+            comp.linkSystemLibrary("dl");
+            comp.linkSystemLibrary("m");
+
+            // Path where CMake produced .so files
+            comp.addLibraryPath(.{ .cwd_relative = "llama.cpp/build/bin" });
+
+            comp.linkSystemLibrary("llama");
+            comp.linkSystemLibrary("ggml");
+            comp.linkSystemLibrary("ggml-base");
+            comp.linkSystemLibrary("ggml-cpu");
+            comp.linkSystemLibrary("ggml-cuda");
+
+            comp.addRPath(.{ .cwd_relative = "llama.cpp/build/bin" });
+        } else {
+            // Source build (CPU / Metal)
+            const lib = ctx.library();
+            comp.linkLibrary(lib);
+        }
+    }
 
     /// build single library containing everything
     pub fn library(ctx: *Self) *CompileStep {
         if (ctx.lib) |l| return l;
-        const lib = ctx.build.addStaticLibrary(std.Build.StaticLibraryOptions{
-            .name = "llama.cpp",
+        const lib = ctx.build.addLibrary(.{ .name = "llama.cpp", .root_module = ctx.build.createModule(.{
             .target = ctx.target,
             .optimize = ctx.optimize,
-        });
+        }) });
+        // const lib = ctx.build.addStaticLibrary(std.Build.StaticLibraryOptions{
+        //     .name = "llama.cpp",
+        //     .target = ctx.target,
+        //     .optimize = ctx.optimize,
+        // });
         lib.root_module.addCMacro("LOG_DISABLE_LOGS", "1");
         lib.root_module.addCMacro("GGML_USE_CPU", "1");
         lib.root_module.addCMacro("LLAMA_FATAL_WARNINGS", "ON");
@@ -146,11 +177,18 @@ pub const BuildContext = struct {
 
     pub fn flags(ctx: Self) []const []const u8 {
         _ = ctx;
-        return &.{"-fno-sanitize=undefined"};
+        return &.{
+            "-fno-sanitize=undefined",
+            "-DNDEBUG",              // disable assertions in llama.cpp
+            "-O3",                   // max optimisation regardless of Zig build mode
+            "-ffast-math",           // reassociation / reciprocal / fused ops
+            "-fno-finite-math-only", // re-enable INFINITY/NaN (llama.cpp requires them)
+        };
     }
     pub fn common(self: Self, lib: *CompileStep) void {
         lib.linkSystemLibrary("stdc++");
         lib.linkSystemLibrary("pthread");
+        lib.linkSystemLibrary("dl");
         lib.linkSystemLibrary("m");
         lib.linkLibCpp();
         lib.addIncludePath(self.build.path("llama.cpp/common"));

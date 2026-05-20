@@ -3,47 +3,50 @@ const http = std.http;
 
 pub const DownloadContext = struct {
     allocator: std.mem.Allocator,
-    client: http.Client,
+    client: *http.Client,
     auth_token: ?[]const u8 = null,
     download_progress: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    download_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    pub fn init(allocator: std.mem.Allocator, auth_token: ?[]const u8) DownloadContext {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        client: *http.Client,
+        auth_token: ?[]const u8,
+    ) DownloadContext {
         return DownloadContext{
             .allocator = allocator,
-            .client = http.Client{ .allocator = allocator },
+            .client = client,
             .auth_token = auth_token,
         };
     }
 
-    pub fn deinit(self: *DownloadContext) void {
-        self.client.deinit();
-    }
-
     /// Builds headers with Authorization automatically
     fn buildHeaders(self: *DownloadContext, extra: []const http.Header) ![]http.Header {
-        var headers = std.ArrayList(http.Header).init(self.allocator);
-        for (extra) |h| try headers.append(h);
+        var headers: std.ArrayList(http.Header) = .empty;
+        for (extra) |h| try headers.append(self.allocator, h);
 
         if (self.auth_token) |token| {
             const bearer = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{token});
-            try headers.append(.{ .name = "Authorization", .value = bearer });
+            try headers.append(self.allocator, .{ .name = "Authorization", .value = bearer });
         }
 
-        return headers.toOwnedSlice();
+        return headers.toOwnedSlice(self.allocator);
     }
 
     /// Perform a request, always injecting Authorization header if needed
-    pub fn do(self: *DownloadContext, uri: std.Uri, method: http.Method, extra: []const http.Header, buf: []u8) !http.Client.Request {
+    pub fn do(self: *DownloadContext, uri: std.Uri, method: http.Method, extra: []const http.Header) !http.Client.Request {
         const headers = try self.buildHeaders(extra);
         //defer for (headers) |h| self.allocator.free(h.value); // free header values
 
         defer self.allocator.free(headers);
 
-        var req = try self.client.open(method, uri, .{
-            .server_header_buffer = buf,
+        var req = try self.client.request(method, uri, .{
             .extra_headers = headers,
+            //.server_header_buffer = buf,
+
+            //.headers = headers,
         });
-        try req.send();
+        try req.sendBodiless();
         // req.send() catch |err| {
         //     switch (err) {
         //         error.RequestFailed => {
@@ -56,7 +59,7 @@ pub const DownloadContext = struct {
         //     return err;
         // };
 
-        try req.wait();
+        //try req.wait();
         return req;
     }
 };

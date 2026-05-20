@@ -3,12 +3,12 @@ const ggufPadding = @import("gguf.zig").ggufPadding;
 const GGUFDataType = @import("types.zig").GGUFDataType;
 const Value = @import("KV.zig").Value;
 pub const GGUFWriter = struct {
-    writer: std.io.AnyWriter,
+    writer: std.fs.File,
     position: usize, // Tracks current write position for alignment
 
     const Self = @This();
 
-    pub fn init(writer: std.io.AnyWriter) Self {
+    pub fn init(writer: std.fs.File) Self {
         return Self{
             .writer = writer,
             .position = 0,
@@ -184,5 +184,9 @@ pub const GGUFWriter = struct {
         for (types) |typ| {
             try self.writeI32(typ);
         }
+    }
+    pub fn writeBytes(self: *Self, bytes: []const u8) !void {
+        try self.writer.writeAll(bytes);
+        self.position += bytes.len;
     }
 };

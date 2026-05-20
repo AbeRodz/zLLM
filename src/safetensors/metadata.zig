@@ -6,6 +6,10 @@ const OffsetEntry = @import("./types.zig").OffsetEntry;
 
 pub const Metadata = struct {
     model_name: []const u8,
+    /// GGUF architecture prefix used for KV keys (e.g. "llama", "gemma3").
+    /// Defaults to model_name; overwritten by prepare_metadata once config.json
+    /// is read and the real model_type is known.
+    arch_prefix: []const u8,
     metadata: std.StringArrayHashMap(Value),
     tensors: std.ArrayList(TensorInfo),
     index_map: std.StringHashMap(usize),
@@ -16,15 +20,16 @@ pub const Metadata = struct {
         tensor_entries: []TensorEntry,
     ) !Metadata {
         var index_map = std.StringHashMap(usize).init(allocator);
-        var tensors = std.ArrayList(TensorInfo).init(allocator);
+        var tensors: std.ArrayList(TensorInfo) = .empty;
 
         for (0.., tensor_entries) |i, entry| {
             try index_map.put(entry.name, i);
-            try tensors.append(entry.info);
+            try tensors.append(allocator, entry.info);
         }
 
         const metadata = Metadata{
             .model_name = model_name,
+            .arch_prefix = model_name,
             .metadata = meta_opt orelse std.StringArrayHashMap(Value).init(allocator),
             .tensors = tensors,
             .index_map = index_map,
@@ -33,7 +38,7 @@ pub const Metadata = struct {
         return metadata;
     }
     pub fn put(self: *Metadata, allocator: std.mem.Allocator, key_suffix: []const u8, value: Value) !void {
-        const full_key_tmp = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ self.model_name, key_suffix });
+        const full_key_tmp = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ self.arch_prefix, key_suffix });
         // Allocate a buffer just large enough to hold the string and copy it
         const full_key = try allocator.alloc(u8, full_key_tmp.len);
         @memcpy(full_key, full_key_tmp);
@@ -45,7 +50,7 @@ pub const Metadata = struct {
     }
     pub fn get(self: *Metadata, allocator: std.mem.Allocator, key_suffix: []const u8) ?Value {
         // Build the full key just like in `put`
-        const full_key_tmp = std.fmt.allocPrint(allocator, "{s}.{s}", .{ self.model_name, key_suffix }) catch return null;
+        const full_key_tmp = std.fmt.allocPrint(allocator, "{s}.{s}", .{ self.arch_prefix, key_suffix }) catch return null;
         defer allocator.free(full_key_tmp);
 
         return self.metadata.get(full_key_tmp);

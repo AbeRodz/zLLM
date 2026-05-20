@@ -138,12 +138,12 @@ pub fn findModelErrorless(name: []const u8) !?ModelInfo {
 pub fn listAvailableModels(allocator: std.mem.Allocator) ![]ModelInfo {
     const models = try parseModels(allocator);
     defer allocator.free(models);
-    var list = std.ArrayList(ModelInfo).init(allocator);
+    var list: std.ArrayList(ModelInfo) = .empty;
 
     for (models) |m| {
         if (try m.isCached()) {
-            try list.append(m);
+            try list.append(allocator, m);
         }
     }
-    return list.toOwnedSlice();
+    return list.toOwnedSlice(allocator);
 }

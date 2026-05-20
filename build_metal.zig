@@ -16,11 +16,15 @@ pub const MetalContext = struct {
     // }
 
     pub fn metalLibrary(ctx: *BuildContext, common: *Step.InstallFile) MetalContext {
-        const metal_lib = ctx.build.addStaticLibrary(.{
-            .name = "ggml-metal",
+        const metal_lib = ctx.build.addLibrary(.{ .name = "ggml-metal", .root_module = ctx.build.createModule(.{
             .target = ctx.target,
             .optimize = ctx.optimize,
-        });
+        }) });
+        // const metal_lib = ctx.build.addStaticLibrary(.{
+        //     .name = "ggml-metal",
+        //     .target = ctx.target,
+        //     .optimize = ctx.optimize,
+        // });
 
         Csources.addMetalIncludes(ctx, metal_lib);
         Csources.addMetalFrameworks(metal_lib);
@@ -30,11 +34,14 @@ pub const MetalContext = struct {
             "ggml-metal.metal",
             "ggml-metal-impl.h",
         };
-        // Compile the metal shader [requires xcode installed]
+        // Compile the metal shader [requires xcode installed].
+        // -fno-fast-math: required by ggml (uses INFINITY/NaN).
+        // -O2: release-level Metal shader optimisation (omit -g to avoid suppressing these).
         const metal_compile = ctx.build.addSystemCommand(&.{
-            "xcrun",          "-sdk",                                                                      "macosx", "metal",
-            "-fno-fast-math", "-g",                                                                        "-c",     ctx.build.pathJoin(&.{ ctx.build.install_path, "metal", "ggml-metal.metal" }),
-            "-o",             ctx.build.pathJoin(&.{ ctx.build.install_path, "metal", "ggml-metal.air" }), "-I",     "llama.cpp/ggml/src",
+            "xcrun",          "-sdk",     "macosx", "metal",
+            "-fno-fast-math", "-O2",      "-c",     ctx.build.pathJoin(&.{ ctx.build.install_path, "metal", "ggml-metal.metal" }),
+            "-o",             ctx.build.pathJoin(&.{ ctx.build.install_path, "metal", "ggml-metal.air" }),
+            "-I",             "llama.cpp/ggml/src",
         });
         metal_compile.step.dependOn(&common.step);
         for (metal_files) |file| {

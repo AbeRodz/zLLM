@@ -781,8 +781,9 @@ pub const TensorNameMap = struct {
                 const bid_str = try std.fmt.allocPrint(allocator, "{}", .{bid});
                 defer allocator.free(bid_str);
 
-                // Replace first occurrence of "{}" in template with bid_str
-                const brace_index = std.mem.indexOf(u8, template, "{}") orelse return error.InvalidTemplate;
+                // Skip tensors whose GGUF name has no block index placeholder —
+                // they are global tensors already handled by the standard mapping step.
+                const brace_index = std.mem.indexOf(u8, template, "{}") orelse continue;
 
                 const prefix = template[0..brace_index];
                 const suffix = template[brace_index + 2 ..];
@@ -802,7 +803,7 @@ pub const TensorNameMap = struct {
                 try map.put(tensor_name, .{ .tensor = tensor, .name = tensor_name });
 
                 for (keys) |key| {
-                    const brace_idx = std.mem.indexOf(u8, key, "{}") orelse return error.InvalidTemplate;
+                    const brace_idx = std.mem.indexOf(u8, key, "{}") orelse continue;
 
                     const pref = key[0..brace_idx];
                     const suff = key[brace_idx + 2 ..];
@@ -841,8 +842,9 @@ pub const TensorNameMap = struct {
         try_suffixes: []const []const u8,
     ) !?MappingEntry {
         // 1. Exact match
-        const stdout = std.io.getStdOut().writer();
-
+        var stdout_buffer: [1024]u8 = undefined;
+        var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+        const stdout = &stdout_writer.interface;
         if (self.mappings.get(key)) |entry| {
             stdout.print("Exact match hit: {s}\n", .{key}) catch {};
             return MappingEntry{ .name = entry.name, .tensor = entry.tensor };
@@ -885,11 +887,13 @@ pub const TensorNameMap = struct {
                 }
             }
         }
-
+        try stdout.flush();
         return null;
     }
     pub fn printMappings(self: *const TensorNameMap) void {
-        const stdout = std.io.getStdOut().writer();
+        var stdout_buffer: [1024]u8 = undefined;
+        var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+        const stdout = &stdout_writer.interface;
 
         stdout.print("=== Global Mappings ===\n", .{}) catch {};
         var map_iter = self.mappings.iterator();
@@ -901,6 +905,7 @@ pub const TensorNameMap = struct {
             //     stdout.print("value:{s}\n", .{val}) catch {};
             // }
         }
+        try stdout.flush();
     }
     pub fn get_name(self: *Self, allocator: std.mem.Allocator, key: []const u8, try_suffixes: []const []const u8) !?[]const u8 {
         const result = try self.get_type_and_name(allocator, key, try_suffixes) orelse return null;

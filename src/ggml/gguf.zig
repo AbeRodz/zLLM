@@ -22,7 +22,7 @@ const GGUF = struct {
         return Self{
             .container = container,
             .kv = KV.init(allocator),
-            .tensors = Tensors.init(allocator),
+            .tensors = Tensors.init(),
             .parameters = 0,
             .alignment = 0,
             .tensorOffset = null,
@@ -59,7 +59,10 @@ const GGUF = struct {
         while (@as(u64, @intCast(i)) < n_kv) : (i += 1) {
             const k = try readGGUFStringFixed(reader, llm, allocator);
             const type_id_u32 = try readGGUF(u32, reader, llm);
-            const stdout = std.io.getStdOut().writer();
+            var stdout_buffer: [1024]u8 = undefined;
+            var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+            const stdout = &stdout_writer.interface;
+
             stdout.print("Key: {s}\n", .{k}) catch {};
             stdout.print("Type ID: {} (0x{x})\n", .{ type_id_u32, type_id_u32 }) catch {};
             stdout.print("Next pos: {}\n", .{reader.pos}) catch {};
@@ -85,6 +88,7 @@ const GGUF = struct {
             // }
             try llm.kv.KV.put(k, v);
             stdout.print("Total KVs decoded: {}/{}\n", .{ i, n_kv }) catch {};
+            try stdout.flush();
         }
 
         // decode tensors
@@ -110,7 +114,7 @@ const GGUF = struct {
                 .shape = shape,
             };
 
-            try llm.tensors.items.append(tensor);
+            try llm.tensors.items.append(allocator, tensor);
             llm.parameters.? += tensor.elements();
         }
         std.debug.print("Total Parameter Count: {d}\n", .{llm.parameters.?});
@@ -270,11 +274,14 @@ pub fn readGGUFArray(llm: *GGUF, reader: *FileReader, allocator: std.mem.Allocat
 }
 
 pub fn readGGUFArrayData(comptime T: type, llm: *GGUF, reader: *FileReader, buf: []T) ![]T {
-    const stdout = std.io.getStdOut().writer();
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
     for (buf) |*item| {
         item.* = try readGGUF(T, reader, llm);
         stdout.print("item: {any}\n", .{item.*}) catch {};
     }
+    try stdout.flush();
     return buf;
 }
 
@@ -286,6 +293,19 @@ pub fn describe(model_name: []const u8, allocator: std.mem.Allocator) !void {
 
     const buffer = try found_model.loadGGUFModelBuffer(allocator);
     defer allocator.free(buffer);
+    const description = try ggml.GGML.describeGGUF(buffer, 4096, allocator);
+    ggml.printDescriptor(description);
+}
+
+pub fn describePath(path: []const u8, allocator: std.mem.Allocator) !void {
+    const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+    defer file.close();
+
+    const file_size = try file.getEndPos();
+    const buffer = try allocator.alloc(u8, file_size);
+    defer allocator.free(buffer);
+    _ = try file.readAll(buffer);
+
     const description = try ggml.GGML.describeGGUF(buffer, 4096, allocator);
     ggml.printDescriptor(description);
 }

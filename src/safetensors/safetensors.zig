@@ -40,7 +40,7 @@ pub fn parseSafetensorsFromBuffer(allocator: std.mem.Allocator, model_name: []co
     var meta_map = std.StringArrayHashMap(Value).init(allocator);
     var iter = root.object.iterator();
 
-    var tensor_entries = std.ArrayList(TensorEntry).init(allocator);
+    var tensor_entries: std.ArrayList(TensorEntry) = .empty;
 
     while (iter.next()) |kv| {
         const name = kv.key_ptr.*;
@@ -146,7 +146,7 @@ pub fn parseSafetensorsFromBuffer(allocator: std.mem.Allocator, model_name: []co
                 .start = start_offset,
             },
         };
-        try tensor_entries.append(TensorEntry{ .name = name, .info = tensor });
+        try tensor_entries.append(allocator, TensorEntry{ .name = name, .info = tensor });
         //const tensor_data = buffer[start_offset..end_offset];
         //std.debug.print("  first byte: {d}\n", .{tensor_data[0]});
     }
@@ -168,7 +168,9 @@ pub fn read(model_name: []const u8, allocator: std.mem.Allocator) !void {
 }
 
 pub fn dumpTensor(tensor_bytes: []const u8, dims: []const usize, dtype: []const u8) !void {
-    var stdout = std.io.getStdOut().writer();
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
 
     const total_elems = blk: {
         var prod: usize = 1;
@@ -202,4 +204,5 @@ pub fn dumpTensor(tensor_bytes: []const u8, dims: []const usize, dtype: []const 
     } else {
         try stdout.print("Unsupported dtype: {s}\n", .{dtype});
     }
+    try stdout.flush();
 }
